@@ -1,0 +1,9 @@
+{
+  "name": "lubdub-share",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows-to-Windows offline file sharing over Wi-Fi Direct legacy mode.",
+  "scripts": {
+    "start": "node src/server.js"
+  }
+}

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LUBDUB Share</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">Windows to Windows</p>
+        <h1>LUBDUB Share</h1>
+        <p class="lede">
+          Share files without internet, without a router, and without cables by creating a
+          temporary Wi-Fi Direct session between nearby PCs.
+        </p>
+      </section>
+
+      <section class="panel">
+        <h2>This Device</h2>
+        <div id="device-card" class="card-grid"></div>
+      </section>
+
+      <section class="two-up">
+        <div class="panel">
+          <h2>Host Session</h2>
+          <p class="muted">
+            This device becomes the session owner and exposes an invite code containing the Wi-Fi
+            Direct SSID and passphrase. You can also send a connect request from the nearby device
+            list and let the other PC approve it.
+          </p>
+          <div class="actions">
+            <button id="start-host">Start Session</button>
+            <button id="stop-host" class="secondary">Stop Session</button>
+          </div>
+          <div id="host-session" class="stack"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Join Session</h2>
+          <p class="muted">
+            Paste the invite code from the host device. The app will connect to the Wi-Fi Direct
+            network, find the host, and register this PC. If the other device sends a connection
+            request, approving it below will connect automatically.
+          </p>
+          <textarea
+            id="invite-code"
+            rows="6"
+            placeholder="Paste invite code from the host device"
+          ></textarea>
+          <div class="actions">
+            <button id="join-session">Join Session</button>
+          </div>
+          <div id="join-status" class="stack"></div>
+        </div>
+      </section>
+
+      <section class="two-up">
+        <div class="panel">
+          <h2>Nearby Devices</h2>
+          <p class="muted">
+            Devices on the same local network can receive a ShareIt-style connection request from
+            here.
+          </p>
+          <div id="nearby-devices" class="stack"></div>
+        </div>
+
+        <div class="panel">
+          <h2>Connection Requests</h2>
+          <p class="muted">
+            When another device asks to connect, approve it here and this PC will join
+            automatically.
+          </p>
+          <div id="incoming-requests" class="stack"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Send File</h2>
+        <form id="send-form" class="send-form">
+          <label>
+            Target device
+            <select id="target-device"></select>
+          </label>
+          <label>
+            File
+            <input id="file-input" type="file" />
+          </label>
+          <button type="submit">Send</button>
+        </form>
+        <div id="send-status" class="stack"></div>
+      </section>
+
+      <section class="two-up">
+        <div class="panel">
+          <h2>Connected Peers</h2>
+          <div id="peers" class="stack"></div>
+        </div>
+        <div class="panel">
+          <h2>Received Files</h2>
+          <div id="received" class="stack"></div>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
