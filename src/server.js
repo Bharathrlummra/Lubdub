@@ -449,6 +449,26 @@ async function joinSessionFromInviteCode(inviteCode) {
   };
 }
 
+async function completeApprovedPairRequest(requestId) {
+  const pendingRequest = state.connectionRequests.get(requestId);
+  if (!pendingRequest || pendingRequest.status !== "joining") {
+    return;
+  }
+
+  try {
+    await joinSessionFromInviteCode(pendingRequest.inviteCode);
+    state.connectionRequests.delete(requestId);
+  } catch (error) {
+    const latestRequest = state.connectionRequests.get(requestId);
+    if (!latestRequest) {
+      return;
+    }
+
+    latestRequest.status = "pending";
+    latestRequest.errorMessage = error.message;
+  }
+}
+
 async function handleHostStart(response) {
   const { created, hostedStatus } = await ensureHostedSession();
   json(response, created ? 201 : 200, serialiseState(hostedStatus));
@@ -596,15 +616,17 @@ async function handlePairApprove(request, response) {
   pendingRequest.status = "joining";
   pendingRequest.errorMessage = null;
 
-  try {
-    await joinSessionFromInviteCode(pendingRequest.inviteCode);
-    state.connectionRequests.delete(body.requestId);
-    json(response, 200, serialiseState(null));
-  } catch (error) {
-    pendingRequest.status = "pending";
-    pendingRequest.errorMessage = error.message;
-    throw error;
-  }
+  json(response, 202, serialiseState(null));
+
+  completeApprovedPairRequest(body.requestId).catch((error) => {
+    const latestRequest = state.connectionRequests.get(body.requestId);
+    if (!latestRequest) {
+      return;
+    }
+
+    latestRequest.status = "pending";
+    latestRequest.errorMessage = error.message;
+  });
 }
 
 async function handlePairReject(request, response) {

@@ -71,6 +71,9 @@ function renderState(payload) {
     hostSession.innerHTML = `<p class="empty">No hosted session is active.</p>`;
   }
 
+  const joiningRequest = payload.pendingConnectionRequests.find((request) => request.status === "joining");
+  const failedRequest = payload.pendingConnectionRequests.find((request) => request.errorMessage);
+
   if (payload.joinedSession) {
     joinStatus.innerHTML = `
       <article class="card card-full">
@@ -86,6 +89,16 @@ function renderState(payload) {
         <strong>${payload.joinedSession.ssid}</strong>
       </article>
     `;
+  } else if (joiningRequest) {
+    joinStatus.innerHTML = `
+      <article class="card card-full">
+        <span class="label">Connecting</span>
+        <strong>${joiningRequest.ssid}</strong>
+        <p class="muted">Approval was accepted. Joining the Wi-Fi Direct session now...</p>
+      </article>
+    `;
+  } else if (failedRequest) {
+    joinStatus.innerHTML = `<p class="error">${failedRequest.errorMessage}</p>`;
   } else if (!joinStatus.querySelector(".success,.error,.muted")) {
     joinStatus.innerHTML = `<p class="empty">This device has not joined a host session yet.</p>`;
   }
@@ -273,7 +286,7 @@ incomingRequests.addEventListener("click", async (event) => {
     await postJson(`/api/pair/${action}`, { requestId });
 
     if (action === "approve") {
-      joinStatus.innerHTML = `<p class="success">Approved and connected successfully.</p>`;
+      joinStatus.innerHTML = `<p class="muted">Approved. Connecting automatically...</p>`;
     } else {
       joinStatus.innerHTML = `<p class="muted">Connection request declined.</p>`;
     }
