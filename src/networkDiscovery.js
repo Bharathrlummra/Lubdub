@@ -1,5 +1,9 @@
 const os = require("node:os");
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function isPrivateIpv4(address) {
   if (address.startsWith("10.") || address.startsWith("192.168.")) {
     return true;
@@ -92,22 +96,36 @@ async function probeHost(ip, sessionId, port, timeoutMs) {
   }
 }
 
-async function discoverHost({ sessionId, port, timeoutMs = 500 }) {
-  const candidates = enumerateCandidates();
+async function discoverHost({
+  sessionId,
+  port,
+  timeoutMs = 800,
+  totalTimeoutMs = 20000,
+  retryDelayMs = 1000,
+}) {
+  const deadline = Date.now() + totalTimeoutMs;
   const concurrency = 20;
-  let cursor = 0;
 
-  while (cursor < candidates.length) {
-    const batch = candidates.slice(cursor, cursor + concurrency);
-    cursor += concurrency;
+  while (Date.now() < deadline) {
+    const candidates = enumerateCandidates();
+    let cursor = 0;
 
-    const results = await Promise.all(
-      batch.map((ip) => probeHost(ip, sessionId, port, timeoutMs)),
-    );
+    while (cursor < candidates.length) {
+      const batch = candidates.slice(cursor, cursor + concurrency);
+      cursor += concurrency;
 
-    const match = results.find(Boolean);
-    if (match) {
-      return match;
+      const results = await Promise.all(
+        batch.map((ip) => probeHost(ip, sessionId, port, timeoutMs)),
+      );
+
+      const match = results.find(Boolean);
+      if (match) {
+        return match;
+      }
+    }
+
+    if (Date.now() < deadline) {
+      await sleep(retryDelayMs);
     }
   }
 
