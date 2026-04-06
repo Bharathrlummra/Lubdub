@@ -87,6 +87,13 @@ function pushDiagnostic(event, details = {}) {
     state.diagnostics.length = MAX_DIAGNOSTIC_ENTRIES;
   }
 
+  const line = `[LUBDUB DEBUG] ${entry.time} ${event} ${JSON.stringify(details)}`;
+  if (event.includes("error")) {
+    console.error(line);
+  } else {
+    console.log(line);
+  }
+
   fsp.appendFile(LOG_FILE, `${JSON.stringify(entry)}\n`, "utf8").catch(() => {});
 }
 

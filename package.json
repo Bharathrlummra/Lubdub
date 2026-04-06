@@ -5,5 +5,8 @@
   "description": "Windows-to-Windows offline file sharing over Wi-Fi Direct legacy mode.",
   "scripts": {
     "start": "node src/server.js"
+  },
+  "dependencies": {
+    "nodemon": "^3.1.14"
   }
 }
