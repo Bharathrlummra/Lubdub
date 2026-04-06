@@ -382,6 +382,15 @@ async function ensureHostedSession() {
   }
 
   const session = createHostedSession();
+  const hostedStatus = await startPreparedHostedSession(session);
+
+  return {
+    created: true,
+    hostedStatus,
+  };
+}
+
+async function startPreparedHostedSession(session) {
   await startHostedNetwork({
     ssid: session.ssid,
     passphrase: session.passphrase,
@@ -395,10 +404,7 @@ async function ensureHostedSession() {
   state.peers.clear();
   state.connectionRequests.clear();
 
-  return {
-    created: true,
-    hostedStatus: await readHostedStatus(session.statusFile),
-  };
+  return readHostedStatus(session.statusFile);
 }
 
 async function joinSessionFromInviteCode(inviteCode) {
@@ -494,7 +500,15 @@ async function handlePairRequest(request, response) {
     return;
   }
 
-  const { hostedStatus } = await ensureHostedSession();
+  let hostedStatus = null;
+  let inviteSession = state.hostedSession;
+
+  if (!inviteSession) {
+    inviteSession = createHostedSession();
+  } else {
+    hostedStatus = await readHostedStatus(inviteSession.statusFile);
+  }
+
   const requestId = crypto.randomUUID();
   const upstream = await fetch(`http://${target.ip}:${target.port}/api/pair/incoming`, {
     method: "POST",
@@ -503,22 +517,26 @@ async function handlePairRequest(request, response) {
     },
     body: JSON.stringify({
       requestId,
-      inviteCode: state.hostedSession.inviteCode,
+      inviteCode: inviteSession.inviteCode,
       sender: {
         deviceId: state.deviceId,
         deviceName: state.deviceName,
         port: PORT,
       },
       session: {
-        sessionId: state.hostedSession.sessionId,
-        ssid: state.hostedSession.ssid,
-        startedAt: state.hostedSession.startedAt,
+        sessionId: inviteSession.sessionId,
+        ssid: inviteSession.ssid,
+        startedAt: inviteSession.startedAt,
       },
     }),
   });
 
   if (!upstream.ok) {
     throw new Error(await readErrorResponse(upstream));
+  }
+
+  if (!state.hostedSession) {
+    hostedStatus = await startPreparedHostedSession(inviteSession);
   }
 
   json(response, 200, serialiseState(hostedStatus));
