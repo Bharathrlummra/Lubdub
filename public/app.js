@@ -5,6 +5,7 @@ const nearbyDevices = document.querySelector("#nearby-devices");
 const incomingRequests = document.querySelector("#incoming-requests");
 const peers = document.querySelector("#peers");
 const received = document.querySelector("#received");
+const diagnostics = document.querySelector("#diagnostics");
 const targetSelect = document.querySelector("#target-device");
 const sendStatus = document.querySelector("#send-status");
 const inviteCodeInput = document.querySelector("#invite-code");
@@ -29,6 +30,10 @@ function describeRole(role) {
   }
 
   return "Idle";
+}
+
+function formatDiagnosticDetails(details) {
+  return JSON.stringify(details, null, 2);
 }
 
 function renderState(payload) {
@@ -181,6 +186,19 @@ function renderState(payload) {
         <strong>${(file.size / 1024).toFixed(1)} KB</strong>
         <p class="muted">From ${file.senderName}</p>
         <p class="muted">${file.savedPath}</p>
+      </article>
+    `,
+  );
+
+  renderList(
+    diagnostics,
+    payload.diagnostics || [],
+    "No diagnostic logs yet.",
+    (entry) => `
+      <article class="card card-full">
+        <span class="label">${entry.event}</span>
+        <strong>${new Date(entry.time).toLocaleString()}</strong>
+        <pre class="diagnostic-details">${formatDiagnosticDetails(entry.details)}</pre>
       </article>
     `,
   );

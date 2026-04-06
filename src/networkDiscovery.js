@@ -175,14 +175,31 @@ async function discoverHost({
   timeoutMs = 800,
   totalTimeoutMs = 20000,
   retryDelayMs = 1000,
+  onDiagnostic = () => {},
 }) {
   const deadline = Date.now() + totalTimeoutMs;
   const concurrency = 20;
+  let attempt = 0;
 
   while (Date.now() < deadline) {
+    attempt += 1;
     const preferredCandidates = await readArpCandidates();
+    const interfaces = getCandidateInterfaces();
     const interfaceCandidates = enumerateCandidates();
     const candidates = buildCandidateList(preferredCandidates, interfaceCandidates);
+    onDiagnostic("discover.scan", {
+      attempt,
+      sessionId,
+      port,
+      interfaces: interfaces.map((iface) => ({
+        name: iface.name,
+        address: iface.address,
+        netmask: iface.netmask,
+      })),
+      preferredCandidates,
+      candidateCount: candidates.length,
+      candidateSample: candidates.slice(0, 20),
+    });
     let cursor = 0;
 
     while (cursor < candidates.length) {
@@ -195,6 +212,12 @@ async function discoverHost({
 
       const match = results.find(Boolean);
       if (match) {
+        onDiagnostic("discover.match", {
+          attempt,
+          sessionId,
+          port,
+          hostIp: match.ip,
+        });
         return match;
       }
     }
@@ -204,6 +227,11 @@ async function discoverHost({
     }
   }
 
+  onDiagnostic("discover.timeout", {
+    sessionId,
+    port,
+    totalTimeoutMs,
+  });
   return null;
 }
 

@@ -23,8 +23,10 @@ const HOST_SCRIPT = path.join(ROOT, "scripts", "start-wifi-direct-host.ps1");
 const JOIN_SCRIPT = path.join(ROOT, "scripts", "join-wifi-direct.ps1");
 const PORT = Number(process.env.APP_PORT || 48621);
 const DEVICE_ID_FILE = path.join(RUNTIME_DIR, "device-id.txt");
+const LOG_FILE = path.join(RUNTIME_DIR, "lubdub-debug.log");
 const MAX_JSON_BYTES = 256 * 1024;
 const NEARBY_DEVICE_STALE_MS = 12000;
+const MAX_DIAGNOSTIC_ENTRIES = 40;
 
 const state = {
   deviceId: "",
@@ -35,6 +37,7 @@ const state = {
   nearbyDevices: new Map(),
   connectionRequests: new Map(),
   receivedFiles: [],
+  diagnostics: [],
 };
 
 const CONTENT_TYPES = {
@@ -69,6 +72,22 @@ function getRole() {
 async function ensureDirectories() {
   await fsp.mkdir(RUNTIME_DIR, { recursive: true });
   await fsp.mkdir(RECEIVED_DIR, { recursive: true });
+  await fsp.appendFile(LOG_FILE, "", "utf8");
+}
+
+function pushDiagnostic(event, details = {}) {
+  const entry = {
+    time: new Date().toISOString(),
+    event,
+    details,
+  };
+
+  state.diagnostics.unshift(entry);
+  if (state.diagnostics.length > MAX_DIAGNOSTIC_ENTRIES) {
+    state.diagnostics.length = MAX_DIAGNOSTIC_ENTRIES;
+  }
+
+  fsp.appendFile(LOG_FILE, `${JSON.stringify(entry)}\n`, "utf8").catch(() => {});
 }
 
 async function getOrCreateDeviceId() {
@@ -194,6 +213,7 @@ function serialiseState(hostedStatus = null) {
     nearbyDevices: listNearbyDevices(),
     pendingConnectionRequests: listConnectionRequests(),
     receivedFiles: state.receivedFiles.slice(0, 10),
+    diagnostics: state.diagnostics.slice(0, 12),
   };
 }
 
@@ -251,6 +271,7 @@ async function readErrorResponse(upstream) {
 }
 
 async function registerWithHost(hostIp, sessionId, port) {
+  pushDiagnostic("register.start", { hostIp, port, sessionId });
   const response = await fetch(`http://${hostIp}:${port}/api/session/register`, {
     method: "POST",
     headers: {
@@ -267,8 +288,12 @@ async function registerWithHost(hostIp, sessionId, port) {
   });
 
   if (!response.ok) {
-    throw new Error(await readErrorResponse(response));
+    const message = await readErrorResponse(response);
+    pushDiagnostic("register.error", { hostIp, port, sessionId, message });
+    throw new Error(message);
   }
+
+  pushDiagnostic("register.success", { hostIp, port, sessionId });
 }
 
 function sanitiseFilename(value) {
@@ -375,6 +400,10 @@ async function handleFileSend(request, response, url) {
 
 async function ensureHostedSession() {
   if (state.hostedSession) {
+    pushDiagnostic("host.reuse", {
+      sessionId: state.hostedSession.sessionId,
+      ssid: state.hostedSession.ssid,
+    });
     return {
       created: false,
       hostedStatus: await readHostedStatus(state.hostedSession.statusFile),
@@ -382,6 +411,10 @@ async function ensureHostedSession() {
   }
 
   const session = createHostedSession();
+  pushDiagnostic("host.prepare", {
+    sessionId: session.sessionId,
+    ssid: session.ssid,
+  });
   const hostedStatus = await startPreparedHostedSession(session);
 
   return {
@@ -391,20 +424,42 @@ async function ensureHostedSession() {
 }
 
 async function startPreparedHostedSession(session) {
-  await startHostedNetwork({
+  pushDiagnostic("host.starting", {
+    sessionId: session.sessionId,
     ssid: session.ssid,
-    passphrase: session.passphrase,
-    statusFile: session.statusFile,
-    stopFile: session.stopFile,
-    scriptPath: HOST_SCRIPT,
   });
+
+  let hostedStatus;
+  try {
+    hostedStatus = await startHostedNetwork({
+      ssid: session.ssid,
+      passphrase: session.passphrase,
+      statusFile: session.statusFile,
+      stopFile: session.stopFile,
+      scriptPath: HOST_SCRIPT,
+    });
+  } catch (error) {
+    pushDiagnostic("host.start.error", {
+      sessionId: session.sessionId,
+      ssid: session.ssid,
+      message: error.message,
+    });
+    throw error;
+  }
 
   state.hostedSession = session;
   state.joinedSession = null;
   state.peers.clear();
   state.connectionRequests.clear();
 
-  return readHostedStatus(session.statusFile);
+  pushDiagnostic("host.started", {
+    sessionId: session.sessionId,
+    ssid: session.ssid,
+    status: hostedStatus?.status || null,
+    message: hostedStatus?.message || null,
+  });
+
+  return hostedStatus || readHostedStatus(session.statusFile);
 }
 
 async function joinSessionFromInviteCode(inviteCode) {
@@ -421,21 +476,59 @@ async function joinSessionFromInviteCode(inviteCode) {
   state.joinedSession = null;
 
   const invitePayload = JSON.parse(base64UrlDecode(inviteCode));
-  await joinHostedNetwork({
-    ssid: invitePayload.ssid,
-    passphrase: invitePayload.passphrase,
-    scriptPath: JOIN_SCRIPT,
-  });
-
-  const discoveredHost = await discoverHost({
+  pushDiagnostic("join.start", {
     sessionId: invitePayload.sessionId,
+    ssid: invitePayload.ssid,
+    hostName: invitePayload.hostName,
     port: invitePayload.port,
   });
 
+  try {
+    const joinResult = await joinHostedNetwork({
+      ssid: invitePayload.ssid,
+      passphrase: invitePayload.passphrase,
+      scriptPath: JOIN_SCRIPT,
+    });
+
+    pushDiagnostic("join.network.connected", {
+      sessionId: invitePayload.sessionId,
+      ssid: invitePayload.ssid,
+      result: joinResult.stdout || null,
+    });
+  } catch (error) {
+    pushDiagnostic("join.network.error", {
+      sessionId: invitePayload.sessionId,
+      ssid: invitePayload.ssid,
+      message: error.message,
+    });
+    throw error;
+  }
+
+  const discoveryEvents = [];
+  const discoveredHost = await discoverHost({
+    sessionId: invitePayload.sessionId,
+    port: invitePayload.port,
+    onDiagnostic: (event, details) => {
+      discoveryEvents.push({ event, details });
+      pushDiagnostic(event, details);
+    },
+  });
+
   if (!discoveredHost) {
+    const latestDiscovery = discoveryEvents.at(-1);
+    pushDiagnostic("join.discovery.error", {
+      sessionId: invitePayload.sessionId,
+      ssid: invitePayload.ssid,
+      latestDiscovery: latestDiscovery || null,
+    });
     throw new Error("Joined the Wi-Fi Direct session, but could not find the host service.");
   }
 
+  pushDiagnostic("join.discovery.success", {
+    sessionId: invitePayload.sessionId,
+    ssid: invitePayload.ssid,
+    hostIp: discoveredHost.ip,
+  });
   await registerWithHost(discoveredHost.ip, invitePayload.sessionId, invitePayload.port);
 
   state.connectionRequests.clear();
@@ -447,6 +540,12 @@ async function joinSessionFromInviteCode(inviteCode) {
     port: invitePayload.port,
     connectedAt: new Date().toISOString(),
   };
+
+  pushDiagnostic("join.complete", {
+    sessionId: invitePayload.sessionId,
+    ssid: invitePayload.ssid,
+    hostIp: discoveredHost.ip,
+  });
 }
 
 async function completeApprovedPairRequest(requestId) {
@@ -456,8 +555,19 @@ async function completeApprovedPairRequest(requestId) {
   }
 
   try {
+    pushDiagnostic("pair.connect.start", {
+      requestId,
+      sessionId: pendingRequest.sessionId,
+      ssid: pendingRequest.ssid,
+      senderName: pendingRequest.senderName,
+    });
     await joinSessionFromInviteCode(pendingRequest.inviteCode);
     state.connectionRequests.delete(requestId);
+    pushDiagnostic("pair.connect.success", {
+      requestId,
+      sessionId: pendingRequest.sessionId,
+      ssid: pendingRequest.ssid,
+    });
   } catch (error) {
     const latestRequest = state.connectionRequests.get(requestId);
     if (!latestRequest) {
@@ -466,6 +576,12 @@ async function completeApprovedPairRequest(requestId) {
 
     latestRequest.status = "pending";
     latestRequest.errorMessage = error.message;
+    pushDiagnostic("pair.connect.error", {
+      requestId,
+      sessionId: latestRequest.sessionId,
+      ssid: latestRequest.ssid,
+      message: error.message,
+    });
   }
 }
 
@@ -520,6 +636,13 @@ async function handlePairRequest(request, response) {
     return;
   }
 
+  pushDiagnostic("pair.request.send", {
+    targetDeviceId: body.targetDeviceId,
+    targetIp: target.ip,
+    targetPort: target.port,
+    targetName: target.deviceName,
+  });
+
   let hostedStatus = null;
   let inviteSession = state.hostedSession;
 
@@ -552,12 +675,27 @@ async function handlePairRequest(request, response) {
   });
 
   if (!upstream.ok) {
-    throw new Error(await readErrorResponse(upstream));
+    const message = await readErrorResponse(upstream);
+    pushDiagnostic("pair.request.error", {
+      targetDeviceId: body.targetDeviceId,
+      targetIp: target.ip,
+      targetPort: target.port,
+      message,
+    });
+    throw new Error(message);
   }
 
   if (!state.hostedSession) {
     hostedStatus = await startPreparedHostedSession(inviteSession);
   }
+
+  pushDiagnostic("pair.request.sent", {
+    requestId,
+    sessionId: inviteSession.sessionId,
+    ssid: inviteSession.ssid,
+    targetDeviceId: body.targetDeviceId,
+    targetName: target.deviceName,
+  });
 
   json(response, 200, serialiseState(hostedStatus));
 }
@@ -597,6 +735,14 @@ async function handleIncomingPairRequest(request, response) {
     errorMessage: null,
   });
 
+  pushDiagnostic("pair.request.received", {
+    requestId: body.requestId,
+    sessionId: body.session.sessionId,
+    ssid: body.session.ssid,
+    senderName: body.sender.deviceName || "Unknown device",
+    senderIp: stripIpv6Prefix(request.socket.remoteAddress || ""),
+  });
+
   json(response, 200, { ok: true });
 }
 
@@ -615,6 +761,12 @@ async function handlePairApprove(request, response) {
 
   pendingRequest.status = "joining";
   pendingRequest.errorMessage = null;
+  pushDiagnostic("pair.request.approved", {
+    requestId: body.requestId,
+    sessionId: pendingRequest.sessionId,
+    ssid: pendingRequest.ssid,
+    senderName: pendingRequest.senderName,
+  });
 
   json(response, 202, serialiseState(null));
 
@@ -641,6 +793,9 @@ async function handlePairReject(request, response) {
     return;
   }
 
+  pushDiagnostic("pair.request.rejected", {
+    requestId: body.requestId,
+  });
   json(response, 200, serialiseState(null));
 }
 
@@ -666,6 +821,13 @@ async function handlePeerRegister(request, response) {
   };
 
   state.peers.set(peer.deviceId, peer);
+  pushDiagnostic("peer.registered", {
+    deviceId: peer.deviceId,
+    deviceName: peer.deviceName,
+    ip: peer.ip,
+    port: peer.port,
+    sessionId: body.sessionId,
+  });
 
   json(response, 200, {
     ok: true,
@@ -770,6 +932,11 @@ async function route(request, response) {
 
     json(response, 404, { error: "Not found" });
   } catch (error) {
+    pushDiagnostic("route.error", {
+      path: url.pathname,
+      method: request.method,
+      message: error.message,
+    });
     json(response, 500, {
       error: error.message,
     });
@@ -779,6 +946,11 @@ async function route(request, response) {
 async function main() {
   await ensureDirectories();
   state.deviceId = await getOrCreateDeviceId();
+  pushDiagnostic("app.start", {
+    deviceId: state.deviceId,
+    deviceName: state.deviceName,
+    port: PORT,
+  });
 
   const nearbyDiscovery = createNearbyDiscovery({
     getAdvertisement: () => ({
