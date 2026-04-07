@@ -1,3 +1,4 @@
+//networkDiscovery.js
 const os = require("node:os");
 const { execFile } = require("node:child_process");
 
