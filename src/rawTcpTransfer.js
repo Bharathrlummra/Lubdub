@@ -37,7 +37,7 @@ function createRawTcpTransferServer({
   saveIncomingTransfer,
   onDiagnostic = () => {},
 }) {
-  const server = net.createServer((socket) => {
+  const server = net.createServer({ allowHalfOpen: true }, (socket) => {
     let frameBuffer = Buffer.alloc(0);
     let metadata = null;
     let writeStream = null;
