@@ -17,7 +17,7 @@ This project is currently a local web app that runs on each PC.
 - Sends a connection request from one PC to another
 - Lets the receiver approve the request with `Approve & Connect`
 - Creates a temporary Wi-Fi Direct session between the two PCs
-- Transfers files directly without internet
+- Transfers files directly without internet using a dedicated raw TCP data socket
 - Saves incoming files in the `Received` folder
 - Shows debug and diagnostic details when a connection fails
 
@@ -196,6 +196,11 @@ These log names help identify the failure point:
 - `register.success`: receiver successfully registered with the sender
 - `register.error`: registration reached the sender but failed
 - `pair.connect.error`: connect flow failed after approval
+- `transfer.tcp.listen`: raw TCP transfer server is listening
+- `transfer.tcp.send.start`: sender started the raw TCP transfer
+- `transfer.tcp.send.ack`: receiver acknowledged the raw TCP transfer
+- `transfer.tcp.receive.start`: receiver started writing an incoming raw TCP transfer
+- `transfer.tcp.receive.complete`: receiver finished saving the transfer
 
 ## Troubleshooting
 
@@ -244,6 +249,7 @@ Received
 ## Project Structure
 
 - `src/server.js`: app server, session handling, request approval, transfer routes, diagnostics
+- `src/rawTcpTransfer.js`: raw TCP single-lane transfer engine used for peer-to-peer file transfer
 - `src/wifiDirectManager.js`: Wi-Fi Direct start and stop logic
 - `src/wifiDirectDiscovery.js`: UDP host discovery after the receiver joins Wi-Fi Direct
 - `src/networkDiscovery.js`: fallback HTTP scan-based host discovery

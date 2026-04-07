@@ -13,6 +13,11 @@ const {
   startHostedNetwork,
   stopHostedNetwork,
 } = require("./wifiDirectManager");
+const {
+  createRawTcpTransferServer,
+  getTransferPort,
+  sendRawTcpTransfer,
+} = require("./rawTcpTransfer");
 const { discoverHost: scanForHost } = require("./networkDiscovery");
 const { createNearbyDiscovery } = require("./nearbyDiscovery");
 const { createWiFiDirectDiscovery } = require("./wifiDirectDiscovery");
@@ -24,6 +29,7 @@ const RECEIVED_DIR = path.join(ROOT, "Received");
 const HOST_SCRIPT = path.join(ROOT, "scripts", "start-wifi-direct-host.ps1");
 const JOIN_SCRIPT = path.join(ROOT, "scripts", "join-wifi-direct.ps1");
 const PORT = Number(process.env.APP_PORT || 48621);
+const TRANSFER_PORT = getTransferPort(PORT);
 const DEVICE_ID_FILE = path.join(RUNTIME_DIR, "device-id.txt");
 const LOG_FILE = path.join(RUNTIME_DIR, "lubdub-debug.log");
 const MAX_JSON_BYTES = 256 * 1024;
@@ -43,6 +49,7 @@ const state = {
 };
 
 const services = {
+  transferServer: null,
   wifiDirectDiscovery: null,
 };
 
@@ -208,6 +215,7 @@ function serialiseState(hostedStatus = null) {
       id: state.deviceId,
       name: state.deviceName,
       port: PORT,
+      transferPort: TRANSFER_PORT,
     },
     role: getRole(),
     hostedSession: state.hostedSession
@@ -296,6 +304,7 @@ async function registerWithHost(hostIp, sessionId, port) {
         deviceId: state.deviceId,
         deviceName: state.deviceName,
         port: PORT,
+        transferPort: TRANSFER_PORT,
       },
     }),
   });
@@ -307,6 +316,7 @@ async function registerWithHost(hostIp, sessionId, port) {
   }
 
   pushDiagnostic("register.success", { hostIp, port, sessionId });
+  return response.json();
 }
 
 function sanitiseFilename(value) {
@@ -321,6 +331,7 @@ function resolveTarget(targetDeviceId) {
       deviceName: state.joinedSession.hostName,
       ip: state.joinedSession.hostIp,
       port: state.joinedSession.port,
+      transferPort: state.joinedSession.transferPort || getTransferPort(state.joinedSession.port),
     };
   }
 
@@ -347,6 +358,41 @@ function rememberNearbyDevice(payload) {
     lastSeenAt: new Date().toISOString(),
     lastSeenMs: Date.now(),
   });
+}
+
+async function prepareIncomingTransfer(metadata) {
+  const originalName = sanitiseFilename(metadata.originalName);
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const storedName = `${timestamp}-${originalName}`;
+  const savedPath = path.join(RECEIVED_DIR, storedName);
+
+  return {
+    originalName,
+    storedName,
+    savedPath,
+    writeStream: fs.createWriteStream(savedPath),
+  };
+}
+
+async function saveIncomingTransfer({ metadata, bytesReceived, savedPath }) {
+  const stats = await fsp.stat(savedPath);
+  const originalName = sanitiseFilename(metadata.originalName);
+  const storedName = path.basename(savedPath);
+
+  state.receivedFiles.unshift({
+    id: metadata.transferId || crypto.randomUUID(),
+    originalName,
+    storedName,
+    savedPath,
+    senderName: metadata.senderName || "Unknown device",
+    size: stats.size || bytesReceived,
+    receivedAt: new Date().toISOString(),
+  });
+
+  return {
+    savedPath,
+    size: stats.size || bytesReceived,
+  };
 }
 
 async function handleFileReceive(request, response) {
@@ -388,26 +434,25 @@ async function handleFileSend(request, response, url) {
     return;
   }
 
-  const upstream = await fetch(`http://${target.ip}:${target.port}/api/files/receive`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/octet-stream",
-      "x-file-name": request.headers["x-file-name"] || "incoming-file",
-      "x-sender-id": state.deviceId,
-      "x-sender-name": state.deviceName,
+  const transferId = crypto.randomUUID();
+  const originalName = sanitiseFilename(request.headers["x-file-name"]);
+  const size = Number(request.headers["content-length"] || 0) || null;
+
+  const payload = await sendRawTcpTransfer({
+    host: target.ip,
+    port: target.transferPort || getTransferPort(target.port || PORT),
+    metadata: {
+      transferId,
+      originalName,
+      senderDeviceId: state.deviceId,
+      senderName: state.deviceName,
+      size,
+      sentAt: new Date().toISOString(),
     },
-    body: request,
-    duplex: "half",
+    sourceStream: request,
+    onDiagnostic: (event, details) => pushDiagnostic(event, details),
   });
 
-  if (!upstream.ok) {
-    json(response, 502, {
-      error: `Peer rejected transfer with status ${upstream.status}.`,
-    });
-    return;
-  }
-
-  const payload = await upstream.json();
   json(response, 200, payload);
 }
 
@@ -563,7 +608,11 @@ async function joinSessionFromInviteCode(inviteCode) {
     ssid: invitePayload.ssid,
     hostIp: discoveredHost.ip,
   });
-  await registerWithHost(discoveredHost.ip, invitePayload.sessionId, invitePayload.port);
+  const registrationPayload = await registerWithHost(
+    discoveredHost.ip,
+    invitePayload.sessionId,
+    invitePayload.port,
+  );
 
   state.connectionRequests.clear();
   state.joinedSession = {
@@ -572,6 +621,8 @@ async function joinSessionFromInviteCode(inviteCode) {
     hostName: invitePayload.hostName,
     hostIp: discoveredHost.ip,
     port: invitePayload.port,
+    transferPort:
+      registrationPayload?.host?.transferPort || getTransferPort(invitePayload.port),
     connectedAt: new Date().toISOString(),
   };
 
@@ -850,6 +901,7 @@ async function handlePeerRegister(request, response) {
     deviceId: body.peer.deviceId,
     deviceName: body.peer.deviceName,
     port: body.peer.port,
+    transferPort: body.peer.transferPort || getTransferPort(body.peer.port || PORT),
     ip: remoteIp,
     connectedAt: new Date().toISOString(),
   };
@@ -860,6 +912,7 @@ async function handlePeerRegister(request, response) {
     deviceName: peer.deviceName,
     ip: peer.ip,
     port: peer.port,
+    transferPort: peer.transferPort,
     sessionId: body.sessionId,
   });
 
@@ -868,6 +921,7 @@ async function handlePeerRegister(request, response) {
     host: {
       deviceId: state.deviceId,
       deviceName: state.deviceName,
+      transferPort: TRANSFER_PORT,
     },
   });
 }
@@ -1010,6 +1064,14 @@ async function main() {
     onDiagnostic: (event, details) => pushDiagnostic(event, details),
   });
 
+  const transferServer = createRawTcpTransferServer({
+    port: TRANSFER_PORT,
+    prepareIncomingTransfer,
+    saveIncomingTransfer,
+    onDiagnostic: (event, details) => pushDiagnostic(event, details),
+  });
+
+  services.transferServer = transferServer;
   services.wifiDirectDiscovery = wifiDirectDiscovery;
 
   const server = http.createServer((request, response) => {
@@ -1022,6 +1084,12 @@ async function main() {
       resolve();
     });
   });
+
+  try {
+    await transferServer.start();
+  } catch (error) {
+    console.warn(`Raw TCP transfer server unavailable: ${error.message}`);
+  }
 
   try {
     await nearbyDiscovery.start();
@@ -1046,6 +1114,7 @@ async function main() {
 
     try {
       await stopHostedNetwork();
+      await transferServer.stop();
       await nearbyDiscovery.stop();
       await wifiDirectDiscovery.stop();
     } finally {
