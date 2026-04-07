@@ -13,8 +13,9 @@ const {
   startHostedNetwork,
   stopHostedNetwork,
 } = require("./wifiDirectManager");
-const { discoverHost } = require("./networkDiscovery");
+const { discoverHost: scanForHost } = require("./networkDiscovery");
 const { createNearbyDiscovery } = require("./nearbyDiscovery");
+const { createWiFiDirectDiscovery } = require("./wifiDirectDiscovery");
 
 const ROOT = path.resolve(__dirname, "..");
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -39,6 +40,10 @@ const state = {
   connectionRequests: new Map(),
   receivedFiles: [],
   diagnostics: [],
+};
+
+const services = {
+  wifiDirectDiscovery: null,
 };
 
 const CONTENT_TYPES = {
@@ -513,14 +518,35 @@ async function joinSessionFromInviteCode(inviteCode) {
   }
 
   const discoveryEvents = [];
-  const discoveredHost = await discoverHost({
-    sessionId: invitePayload.sessionId,
-    port: invitePayload.port,
-    onDiagnostic: (event, details) => {
-      discoveryEvents.push({ event, details });
-      pushDiagnostic(event, details);
-    },
-  });
+  let discoveredHost = null;
+
+  if (services.wifiDirectDiscovery) {
+    discoveredHost = await services.wifiDirectDiscovery.discoverHost({
+      sessionId: invitePayload.sessionId,
+      port: invitePayload.port,
+      onDiagnostic: (event, details) => {
+        discoveryEvents.push({ event, details });
+        pushDiagnostic(event, details);
+      },
+    });
+  }
+
+  if (!discoveredHost) {
+    pushDiagnostic("join.discovery.fallback.start", {
+      sessionId: invitePayload.sessionId,
+      ssid: invitePayload.ssid,
+    });
+
+    discoveredHost = await scanForHost({
+      sessionId: invitePayload.sessionId,
+      port: invitePayload.port,
+      totalTimeoutMs: 12000,
+      onDiagnostic: (event, details) => {
+        discoveryEvents.push({ event, details });
+        pushDiagnostic(event, details);
+      },
+    });
+  }
 
   if (!discoveredHost) {
     const latestDiscovery = discoveryEvents.at(-1);
@@ -971,6 +997,21 @@ async function main() {
     onPeerDiscovered: rememberNearbyDevice,
   });
 
+  const wifiDirectDiscovery = createWiFiDirectDiscovery({
+    getHostAdvertisement: () =>
+      state.hostedSession
+        ? {
+            sessionId: state.hostedSession.sessionId,
+            deviceId: state.deviceId,
+            deviceName: state.deviceName,
+            port: PORT,
+          }
+        : null,
+    onDiagnostic: (event, details) => pushDiagnostic(event, details),
+  });
+
+  services.wifiDirectDiscovery = wifiDirectDiscovery;
+
   const server = http.createServer((request, response) => {
     route(request, response);
   });
@@ -988,6 +1029,12 @@ async function main() {
     console.warn(`Nearby discovery unavailable: ${error.message}`);
   }
 
+  try {
+    await wifiDirectDiscovery.start();
+  } catch (error) {
+    console.warn(`Wi-Fi Direct discovery unavailable: ${error.message}`);
+  }
+
   let shuttingDown = false;
 
   async function shutdown() {
@@ -1000,6 +1047,7 @@ async function main() {
     try {
       await stopHostedNetwork();
       await nearbyDiscovery.stop();
+      await wifiDirectDiscovery.stop();
     } finally {
       server.close(() => process.exit(0));
     }

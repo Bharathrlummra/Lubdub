@@ -187,6 +187,11 @@ These log names help identify the failure point:
 - `discover.scan`: receiver scanned for the sender host service
 - `discover.match`: receiver found the sender host IP
 - `discover.timeout`: receiver could not find the sender host service in time
+- `wifi-discovery.discover.send`: receiver broadcast a UDP host discovery request
+- `wifi-discovery.request`: sender received the UDP discovery request
+- `wifi-discovery.reply`: sender replied with host readiness
+- `wifi-discovery.match`: receiver matched a UDP host-ready reply
+- `wifi-discovery.timeout`: receiver did not receive a UDP host reply in time
 - `register.start`: receiver tried to register with the sender
 - `register.success`: receiver successfully registered with the sender
 - `register.error`: registration reached the sender but failed
@@ -240,7 +245,8 @@ Received
 
 - `src/server.js`: app server, session handling, request approval, transfer routes, diagnostics
 - `src/wifiDirectManager.js`: Wi-Fi Direct start and stop logic
-- `src/networkDiscovery.js`: sender host discovery after the receiver joins Wi-Fi Direct
+- `src/wifiDirectDiscovery.js`: UDP host discovery after the receiver joins Wi-Fi Direct
+- `src/networkDiscovery.js`: fallback HTTP scan-based host discovery
 - `src/nearbyDiscovery.js`: local-network discovery before Wi-Fi Direct connection starts
 - `scripts/start-wifi-direct-host.ps1`: starts the Wi-Fi Direct host session
 - `scripts/join-wifi-direct.ps1`: joins a Wi-Fi Direct session from invite data
