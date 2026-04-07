@@ -11,6 +11,10 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function parseJsonFile(raw) {
+  return JSON.parse(raw.replace(/^\uFEFF/, ""));
+}
+
 function runPowerShellFile(scriptPath, args) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -38,7 +42,7 @@ async function waitForStatus(statusFile, timeoutMs = 10000) {
   while (Date.now() < deadline) {
     if (fs.existsSync(statusFile)) {
       const raw = await fsp.readFile(statusFile, "utf8");
-      const parsed = JSON.parse(raw);
+      const parsed = parseJsonFile(raw);
 
       if (parsed.status === "Error") {
         throw new Error(parsed.message || "Wi-Fi Direct host failed to start.");
@@ -132,7 +136,7 @@ async function readHostedStatus(statusFile) {
   }
 
   const raw = await fsp.readFile(statusFile, "utf8");
-  return JSON.parse(raw);
+  return parseJsonFile(raw);
 }
 
 module.exports = {
