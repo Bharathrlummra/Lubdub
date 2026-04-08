@@ -332,6 +332,8 @@ document.querySelector("#send-form").addEventListener("submit", async (event) =>
       headers: {
         "Content-Type": "application/octet-stream",
         "x-file-name": file.name,
+        "x-file-size": String(file.size),
+        "x-file-last-modified": String(file.lastModified || 0),
       },
       body: file,
     });
