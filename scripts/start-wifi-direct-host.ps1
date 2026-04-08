@@ -22,7 +22,8 @@ function Write-Status {
         updatedAt = (Get-Date).ToString("o")
     }
 
-    $payload | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $StatusFile -Encoding UTF8
+    $json = $payload | ConvertTo-Json -Depth 4
+    [System.IO.File]::WriteAllText($StatusFile, $json, [System.Text.UTF8Encoding]::new($false))
 }
 
 try {

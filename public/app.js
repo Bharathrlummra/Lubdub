@@ -1,333 +1,420 @@
-const deviceCard = document.querySelector("#device-card");
-const hostSession = document.querySelector("#host-session");
-const joinStatus = document.querySelector("#join-status");
+// app.js — LUBDUB Share frontend
+
+// ── DOM References ──
+
+const deviceBadge = document.querySelector("#device-badge");
 const nearbyDevices = document.querySelector("#nearby-devices");
+const nearbyCount = document.querySelector("#nearby-count");
 const incomingRequests = document.querySelector("#incoming-requests");
+const requestCount = document.querySelector("#request-count");
+const connectionStatus = document.querySelector("#connection-status");
+const connectionPill = document.querySelector("#connection-pill");
 const peers = document.querySelector("#peers");
 const received = document.querySelector("#received");
+const receivedCount = document.querySelector("#received-count");
 const diagnostics = document.querySelector("#diagnostics");
 const targetSelect = document.querySelector("#target-device");
 const sendStatus = document.querySelector("#send-status");
-const inviteCodeInput = document.querySelector("#invite-code");
 const fileInput = document.querySelector("#file-input");
+const dropZone = document.querySelector("#drop-zone");
+const fileSelected = document.querySelector("#file-selected");
+const selectedFileName = document.querySelector("#selected-file-name");
+const selectedFileSize = document.querySelector("#selected-file-size");
+const clearFileBtn = document.querySelector("#clear-file");
+const sendBtn = document.querySelector("#send-btn");
+const progressContainer = document.querySelector("#progress-container");
+const progressPhase = document.querySelector("#progress-phase");
+const progressPct = document.querySelector("#progress-pct");
+const progressFill = document.querySelector("#progress-fill");
+const progressSpeed = document.querySelector("#progress-speed");
+const progressDetail = document.querySelector("#progress-detail");
+const inviteCodeInput = document.querySelector("#invite-code");
+const hostSession = document.querySelector("#host-session");
+
+// ── Utilities ──
+
+function esc(text) {
+  if (text === null || text === undefined) return "";
+  const div = document.createElement("div");
+  div.textContent = String(text);
+  return div.innerHTML;
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  const value = bytes / Math.pow(1024, i);
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
+}
+
+function formatSpeed(bytesPerSecond) {
+  if (!bytesPerSecond || bytesPerSecond <= 0) return "";
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatEta(seconds) {
+  if (!seconds || seconds <= 0 || !isFinite(seconds)) return "";
+  if (seconds < 60) return `${Math.ceil(seconds)}s left`;
+  if (seconds < 3600) return `${Math.ceil(seconds / 60)}m left`;
+  return `${Math.floor(seconds / 3600)}h ${Math.ceil((seconds % 3600) / 60)}m left`;
+}
+
+function timeAgo(isoString) {
+  const delta = Math.floor((Date.now() - new Date(isoString).getTime()) / 1000);
+  if (delta < 5) return "just now";
+  if (delta < 60) return `${delta}s ago`;
+  if (delta < 3600) return `${Math.floor(delta / 60)}m ago`;
+  return new Date(isoString).toLocaleTimeString();
+}
+
+// ── Render helpers ──
+
+function renderEmpty(text) {
+  return `<p class="empty-text">${esc(text)}</p>`;
+}
 
 function renderList(container, items, emptyText, renderItem) {
-  if (!items.length) {
-    container.innerHTML = `<p class="empty">${emptyText}</p>`;
+  if (!items || !items.length) {
+    container.innerHTML = renderEmpty(emptyText);
     return;
   }
-
   container.innerHTML = items.map(renderItem).join("");
 }
 
-function describeRole(role) {
-  if (role === "host") {
-    return "Hosting";
-  }
-
-  if (role === "client") {
-    return "Connected";
-  }
-
-  return "Idle";
-}
-
-function formatDiagnosticDetails(details) {
-  return JSON.stringify(details, null, 2);
-}
+// ── State Rendering ──
 
 function renderState(payload) {
-  deviceCard.innerHTML = `
-    <article class="card">
-      <span class="label">Name</span>
-      <strong>${payload.device.name}</strong>
-    </article>
-    <article class="card">
-      <span class="label">Device ID</span>
-      <strong>${payload.device.id}</strong>
-    </article>
-    <article class="card">
-      <span class="label">Role</span>
-      <strong>${payload.role}</strong>
-    </article>
-  `;
+  // Device badge
+  deviceBadge.textContent = `${payload.device.name} · ${payload.role}`;
 
-  if (payload.hostedSession) {
-    hostSession.innerHTML = `
-      <article class="card card-full">
-        <span class="label">SSID</span>
-        <strong>${payload.hostedSession.ssid}</strong>
-      </article>
-      <article class="card card-full">
-        <span class="label">Passphrase</span>
-        <strong>${payload.hostedSession.passphrase}</strong>
-      </article>
-      <article class="card card-full">
-        <span class="label">Invite Code</span>
-        <textarea readonly rows="6">${payload.hostedSession.inviteCode}</textarea>
-      </article>
-      <article class="card card-full">
-        <span class="label">Status</span>
-        <strong>${payload.hostedSession.status?.status || "Starting"}</strong>
-        <p class="muted">${payload.hostedSession.status?.message || ""}</p>
-      </article>
-    `;
+  // Connection pill
+  connectionPill.className = "status-pill";
+  if (payload.role === "host") {
+    connectionPill.classList.add("hosting");
+    connectionPill.textContent = "Hosting";
+  } else if (payload.role === "client") {
+    connectionPill.classList.add("connected");
+    connectionPill.textContent = "Connected";
   } else {
-    hostSession.innerHTML = `<p class="empty">No hosted session is active.</p>`;
+    connectionPill.textContent = "Idle";
   }
 
-  const joiningRequest = payload.pendingConnectionRequests.find((request) => request.status === "joining");
-  const failedRequest = payload.pendingConnectionRequests.find((request) => request.errorMessage);
-
+  // Connection status
   if (payload.joinedSession) {
-    joinStatus.innerHTML = `
-      <article class="card card-full">
-        <span class="label">Connected to</span>
-        <strong>${payload.joinedSession.hostName}</strong>
-      </article>
-      <article class="card card-full">
-        <span class="label">Host IP</span>
-        <strong>${payload.joinedSession.hostIp}</strong>
-      </article>
-      <article class="card card-full">
-        <span class="label">Session</span>
-        <strong>${payload.joinedSession.ssid}</strong>
-      </article>
-    `;
-  } else if (joiningRequest) {
-    joinStatus.innerHTML = `
-      <article class="card card-full">
-        <span class="label">Connecting</span>
-        <strong>${joiningRequest.ssid}</strong>
-        <p class="muted">Approval was accepted. Joining the Wi-Fi Direct session now...</p>
-      </article>
-    `;
-  } else if (failedRequest) {
-    joinStatus.innerHTML = `<p class="error">${failedRequest.errorMessage}</p>`;
-  } else if (!joinStatus.querySelector(".success,.error,.muted")) {
-    joinStatus.innerHTML = `<p class="empty">This device has not joined a host session yet.</p>`;
+    connectionStatus.innerHTML = `
+      <div class="card">
+        <div class="card-title">Connected to ${esc(payload.joinedSession.hostName)}</div>
+        <div class="card-meta">${esc(payload.joinedSession.ssid)} · ${esc(payload.joinedSession.hostIp)}</div>
+      </div>`;
+  } else if (payload.hostedSession) {
+    connectionStatus.innerHTML = `
+      <div class="card">
+        <div class="card-title">Hosting ${esc(payload.hostedSession.ssid)}</div>
+        <div class="card-meta">Status: ${esc(payload.hostedSession.status?.status || "Starting")} · ${esc(payload.hostedSession.status?.message || "")}</div>
+      </div>`;
+  } else {
+    const joiningReq = payload.pendingConnectionRequests.find(r => r.status === "joining");
+    const failedReq = payload.pendingConnectionRequests.find(r => r.errorMessage);
+    if (joiningReq) {
+      connectionStatus.innerHTML = `
+        <div class="card">
+          <div class="card-title">Connecting to ${esc(joiningReq.ssid)}...</div>
+          <div class="card-meta">Approved. Joining Wi-Fi Direct session now.</div>
+        </div>`;
+    } else if (failedReq) {
+      connectionStatus.innerHTML = `<div class="msg msg-error">${esc(failedReq.errorMessage)}</div>`;
+    } else {
+      connectionStatus.innerHTML = renderEmpty("Not connected. Select a nearby device to start.");
+    }
   }
 
-  renderList(
-    nearbyDevices,
-    payload.nearbyDevices,
-    "No nearby devices discovered yet. Keep both PCs open on this screen.",
+  // Nearby devices
+  nearbyCount.textContent = payload.nearbyDevices.length;
+  renderList(nearbyDevices, payload.nearbyDevices,
+    "Scanning... Keep both PCs on this screen.",
     (device) => {
       const canRequest = payload.role !== "client" && device.acceptingRequests;
-      const buttonMarkup = canRequest
-        ? `<button data-pair-target="${device.deviceId}">Send Connect Request</button>`
-        : `<button disabled>${device.acceptingRequests ? "Unavailable" : "Busy"}</button>`;
-
+      const btnHtml = canRequest
+        ? `<button class="btn btn-primary btn-sm" data-pair-target="${esc(device.deviceId)}">Connect</button>`
+        : `<button class="btn btn-secondary btn-sm" disabled>${device.acceptingRequests ? "Unavailable" : "Busy"}</button>`;
       return `
-        <article class="card card-full">
-          <span class="label">${device.deviceName}</span>
-          <strong>${describeRole(device.role)}</strong>
-          <p class="muted">${device.ip}:${device.port}</p>
-          <p class="muted">Last seen ${new Date(device.lastSeenAt).toLocaleTimeString()}</p>
-          <div class="actions compact-actions">
-            ${buttonMarkup}
-          </div>
-        </article>
-      `;
-    },
+        <div class="card">
+          <div class="card-title">${esc(device.deviceName)}</div>
+          <div class="card-meta">${esc(device.ip)}:${esc(device.port)} · ${timeAgo(device.lastSeenAt)}</div>
+          <div class="card-actions">${btnHtml}</div>
+        </div>`;
+    }
   );
 
-  renderList(
-    incomingRequests,
-    payload.pendingConnectionRequests,
-    "No connection requests waiting for approval.",
-    (request) => {
-      const isJoining = request.status === "joining";
-      const statusText = isJoining ? "Connecting after approval..." : "Ready for approval";
-      const errorMarkup = request.errorMessage
-        ? `<p class="error">${request.errorMessage}</p>`
-        : "";
-
+  // Connection requests
+  requestCount.textContent = payload.pendingConnectionRequests.length;
+  renderList(incomingRequests, payload.pendingConnectionRequests,
+    "No pending requests.",
+    (req) => {
+      const isJoining = req.status === "joining";
+      const errorHtml = req.errorMessage ? `<div class="msg msg-error" style="margin-top:8px">${esc(req.errorMessage)}</div>` : "";
       return `
-        <article class="card card-full">
-          <span class="label">${request.senderName}</span>
-          <strong>${request.ssid}</strong>
-          <p class="muted">${statusText}</p>
-          <p class="muted">Requested at ${new Date(request.sentAt).toLocaleString()}</p>
-          ${errorMarkup}
-          <div class="actions compact-actions">
-            <button data-request-action="approve" data-request-id="${request.requestId}" ${
-              isJoining ? "disabled" : ""
-            }>Approve & Connect</button>
-            <button class="secondary" data-request-action="reject" data-request-id="${request.requestId}" ${
-              isJoining ? "disabled" : ""
-            }>Decline</button>
+        <div class="card">
+          <div class="card-title">${esc(req.senderName)}</div>
+          <div class="card-meta">${esc(req.ssid)} · ${isJoining ? "Connecting..." : "Awaiting approval"}</div>
+          ${errorHtml}
+          <div class="card-actions">
+            <button class="btn btn-primary btn-sm" data-request-action="approve" data-request-id="${esc(req.requestId)}" ${isJoining ? "disabled" : ""}>Approve</button>
+            <button class="btn btn-outline btn-sm" data-request-action="reject" data-request-id="${esc(req.requestId)}" ${isJoining ? "disabled" : ""}>Decline</button>
           </div>
-        </article>
-      `;
-    },
+        </div>`;
+    }
   );
 
-  renderList(
-    peers,
-    payload.peers,
-    "No peers connected yet.",
+  // Peers
+  renderList(peers, payload.peers, "No peers connected.",
     (peer) => `
-      <article class="card card-full">
-        <span class="label">${peer.deviceName}</span>
-        <strong>${peer.ip}:${peer.port}</strong>
-        <p class="muted">Connected at ${new Date(peer.connectedAt).toLocaleString()}</p>
-      </article>
-    `,
+      <div class="card">
+        <div class="card-title">${esc(peer.deviceName)}</div>
+        <div class="card-meta">${esc(peer.ip)}:${esc(peer.port)}</div>
+      </div>`
   );
 
-  renderList(
-    received,
-    payload.receivedFiles,
-    "No files received yet.",
-    (file) => `
-      <article class="card card-full">
-        <span class="label">${file.originalName}</span>
-        <strong>${(file.size / 1024).toFixed(1)} KB</strong>
-        <p class="muted">From ${file.senderName}</p>
-        <p class="muted">${file.savedPath}</p>
-      </article>
-    `,
+  // Received files
+  receivedCount.textContent = payload.receivedFiles.length;
+  renderList(received, payload.receivedFiles.slice(0, 10), "No files received yet.",
+    (file) => {
+      let hashHtml = "";
+      if (file.hashVerified === true) {
+        hashHtml = `<span class="hash-badge hash-verified">✓ Verified</span>`;
+      } else if (file.hashVerified === false) {
+        hashHtml = `<span class="hash-badge hash-failed">✕ Hash mismatch</span>`;
+      }
+      return `
+        <div class="card">
+          <div class="card-title">${esc(file.originalName)} ${hashHtml}</div>
+          <div class="card-meta">${formatBytes(file.size)} · from ${esc(file.senderName)} · ${timeAgo(file.receivedAt)}</div>
+        </div>`;
+    }
   );
 
-  renderList(
-    diagnostics,
-    payload.diagnostics || [],
-    "No diagnostic logs yet.",
+  // Diagnostics
+  renderList(diagnostics, (payload.diagnostics || []).slice(0, 15), "No logs yet.",
     (entry) => `
-      <article class="card card-full">
-        <span class="label">${entry.event}</span>
-        <strong>${new Date(entry.time).toLocaleString()}</strong>
-        <pre class="diagnostic-details">${formatDiagnosticDetails(entry.details)}</pre>
-      </article>
-    `,
+      <div class="card">
+        <div class="card-title">${esc(entry.event)}</div>
+        <div class="card-meta">${timeAgo(entry.time)}</div>
+        <pre class="diag-pre">${esc(JSON.stringify(entry.details, null, 2))}</pre>
+      </div>`
   );
 
+  // Targets
+  const prevValue = targetSelect.value;
   targetSelect.innerHTML = payload.targets.length
-    ? payload.targets
-        .map(
-          (target) =>
-            `<option value="${target.deviceId}">${target.deviceName} (${target.role})</option>`,
-        )
-        .join("")
+    ? payload.targets.map(t =>
+        `<option value="${esc(t.deviceId)}">${esc(t.deviceName)} (${esc(t.role)})</option>`
+      ).join("")
     : `<option value="">No target available</option>`;
+  if (prevValue && [...targetSelect.options].some(o => o.value === prevValue)) {
+    targetSelect.value = prevValue;
+  }
+  updateSendButton();
+
+  // Host session (in details panel)
+  if (payload.hostedSession) {
+    hostSession.innerHTML = `
+      <div class="card">
+        <div class="card-title">${esc(payload.hostedSession.ssid)}</div>
+        <div class="card-meta">Pass: ${esc(payload.hostedSession.passphrase)}</div>
+        <div class="card-meta">Status: ${esc(payload.hostedSession.status?.status || "Starting")}</div>
+      </div>`;
+  } else {
+    hostSession.innerHTML = renderEmpty("No active host session.");
+  }
 }
 
+// ── File Selection ──
+
+let selectedFile = null;
+
+function showFileSelection(file) {
+  selectedFile = file;
+  selectedFileName.textContent = file.name;
+  selectedFileSize.textContent = formatBytes(file.size);
+  fileSelected.hidden = false;
+  dropZone.style.display = "none";
+  updateSendButton();
+}
+
+function clearFileSelection() {
+  selectedFile = null;
+  fileInput.value = "";
+  fileSelected.hidden = true;
+  dropZone.style.display = "";
+  updateSendButton();
+}
+
+function updateSendButton() {
+  sendBtn.disabled = !selectedFile || !targetSelect.value;
+}
+
+fileInput.addEventListener("change", () => {
+  if (fileInput.files[0]) showFileSelection(fileInput.files[0]);
+});
+
+clearFileBtn.addEventListener("click", clearFileSelection);
+
+// Drop zone
+dropZone.addEventListener("click", () => fileInput.click());
+
+dropZone.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  dropZone.classList.add("drag-over");
+});
+
+dropZone.addEventListener("dragleave", () => {
+  dropZone.classList.remove("drag-over");
+});
+
+dropZone.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dropZone.classList.remove("drag-over");
+  if (e.dataTransfer.files[0]) showFileSelection(e.dataTransfer.files[0]);
+});
+
+targetSelect.addEventListener("change", updateSendButton);
+
+// ── API Helpers ──
+
 async function fetchState() {
-  const response = await fetch("/api/state");
-  const payload = await response.json();
-  renderState(payload);
+  try {
+    const res = await fetch("/api/state");
+    const payload = await res.json();
+    renderState(payload);
+  } catch {
+    // Silently retry on next poll.
+  }
 }
 
 async function postJson(url, body = {}) {
-  const response = await fetch(url, {
+  const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Request failed.");
-  }
-
-  renderState(payload);
+  const payload = await res.json();
+  if (!res.ok) throw new Error(payload.error || "Request failed.");
+  if (payload.device) renderState(payload);
   return payload;
 }
 
-document.querySelector("#start-host").addEventListener("click", async () => {
-  sendStatus.innerHTML = `<p class="muted">Starting Wi-Fi Direct host session...</p>`;
-  try {
-    await postJson("/api/host/start");
-    sendStatus.innerHTML = `<p class="success">Host session is ready.</p>`;
-  } catch (error) {
-    sendStatus.innerHTML = `<p class="error">${error.message}</p>`;
-  }
-});
+function showStatus(type, msg) {
+  sendStatus.innerHTML = `<div class="msg msg-${type}">${esc(msg)}</div>`;
+}
 
-document.querySelector("#stop-host").addEventListener("click", async () => {
-  try {
-    await postJson("/api/host/stop");
-    sendStatus.innerHTML = `<p class="muted">Host session stopped.</p>`;
-  } catch (error) {
-    sendStatus.innerHTML = `<p class="error">${error.message}</p>`;
-  }
-});
+// ── Progress Polling ──
 
-document.querySelector("#join-session").addEventListener("click", async () => {
-  joinStatus.innerHTML = `<p class="muted">Joining Wi-Fi Direct session and locating the host...</p>`;
-  try {
-    await postJson("/api/session/join", {
-      inviteCode: inviteCodeInput.value.trim(),
-    });
-    joinStatus.innerHTML = `<p class="success">Joined session successfully.</p>`;
-    inviteCodeInput.value = "";
-  } catch (error) {
-    joinStatus.innerHTML = `<p class="error">${error.message}</p>`;
-  }
-});
+let progressInterval = null;
+let lastProgressBytes = 0;
+let lastProgressTime = 0;
 
-nearbyDevices.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-pair-target]");
-  if (!button) {
-    return;
-  }
+function startProgressPolling() {
+  progressContainer.hidden = false;
+  lastProgressBytes = 0;
+  lastProgressTime = Date.now();
 
-  sendStatus.innerHTML = `<p class="muted">Sending connection request...</p>`;
+  progressInterval = setInterval(async () => {
+    try {
+      const res = await fetch("/api/transfer/progress");
+      const data = await res.json();
 
-  try {
-    await postJson("/api/pair/request", {
-      targetDeviceId: button.dataset.pairTarget,
-    });
-    sendStatus.innerHTML = `<p class="success">Connection request sent. The other device can approve and connect now.</p>`;
-  } catch (error) {
-    sendStatus.innerHTML = `<p class="error">${error.message}</p>`;
-  }
-});
+      if (!data.active || !data.transfer) {
+        stopProgressPolling();
+        return;
+      }
 
-incomingRequests.addEventListener("click", async (event) => {
-  const button = event.target.closest("[data-request-action]");
-  if (!button) {
-    return;
-  }
+      const t = data.transfer;
+      const phaseLabels = {
+        caching: "Caching upload...",
+        transferring: "Transferring...",
+        verifying: "Verifying integrity...",
+        complete: "Complete ✓",
+        error: "Failed",
+      };
+      progressPhase.textContent = phaseLabels[t.phase] || t.phase;
 
-  const action = button.dataset.requestAction;
-  const requestId = button.dataset.requestId;
+      let pct = 0;
+      let currentBytes = 0;
 
-  if (action === "approve") {
-    joinStatus.innerHTML = `<p class="muted">Approving request and connecting automatically...</p>`;
-  }
+      if (t.phase === "caching") {
+        pct = t.size > 0 ? Math.round((t.bytesCached / t.size) * 100) : 0;
+        currentBytes = t.bytesCached;
+      } else if (t.phase === "transferring" || t.phase === "verifying") {
+        pct = t.totalChunks > 0 ? Math.round((t.chunksSent / t.totalChunks) * 100) : 0;
+        currentBytes = t.chunksSent * (t.size / (t.totalChunks || 1));
+      } else if (t.phase === "complete") {
+        pct = 100;
+        currentBytes = t.size;
+      }
 
-  try {
-    await postJson(`/api/pair/${action}`, { requestId });
+      progressPct.textContent = `${Math.min(pct, 100)}%`;
+      progressFill.style.width = `${Math.min(pct, 100)}%`;
 
-    if (action === "approve") {
-      joinStatus.innerHTML = `<p class="muted">Approved. Connecting automatically...</p>`;
-    } else {
-      joinStatus.innerHTML = `<p class="muted">Connection request declined.</p>`;
+      // Speed calculation
+      const now = Date.now();
+      const elapsed = (now - lastProgressTime) / 1000;
+      if (elapsed > 0.5) {
+        const speed = (currentBytes - lastProgressBytes) / elapsed;
+        progressSpeed.textContent = speed > 0 ? formatSpeed(speed) : "";
+        const remaining = t.size - currentBytes;
+        progressDetail.textContent = speed > 0 ? formatEta(remaining / speed) : formatBytes(t.size);
+        lastProgressBytes = currentBytes;
+        lastProgressTime = now;
+      }
+
+      if (t.phase === "complete") {
+        progressPhase.textContent = t.hashVerified === true
+          ? "Complete ✓ Verified"
+          : t.hashVerified === false
+            ? "Complete ⚠ Hash mismatch"
+            : "Complete ✓";
+        setTimeout(() => stopProgressPolling(), 3000);
+      }
+
+      if (t.phase === "error") {
+        progressPhase.textContent = `Failed: ${t.error || "Unknown error"}`;
+        setTimeout(() => stopProgressPolling(), 5000);
+      }
+    } catch {
+      // Retry next poll.
     }
-  } catch (error) {
-    joinStatus.innerHTML = `<p class="error">${error.message}</p>`;
+  }, 500);
+}
+
+function stopProgressPolling() {
+  if (progressInterval) {
+    clearInterval(progressInterval);
+    progressInterval = null;
   }
-});
+  setTimeout(() => {
+    progressContainer.hidden = true;
+    progressFill.style.width = "0%";
+    progressPct.textContent = "0%";
+    progressSpeed.textContent = "";
+    progressDetail.textContent = "";
+  }, 300);
+}
 
-document.querySelector("#send-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
+// ── Send File ──
 
-  const file = fileInput.files[0];
+sendBtn.addEventListener("click", async () => {
+  if (!selectedFile || !targetSelect.value) return;
+
+  const file = selectedFile;
   const targetDeviceId = targetSelect.value;
 
-  if (!file || !targetDeviceId) {
-    sendStatus.innerHTML = `<p class="error">Choose a target device and a file first.</p>`;
-    return;
-  }
-
-  sendStatus.innerHTML = `<p class="muted">Sending ${file.name}...</p>`;
+  sendBtn.disabled = true;
+  showStatus("info", `Sending ${file.name}...`);
+  startProgressPolling();
 
   try {
-    const response = await fetch(`/api/files/send?targetDeviceId=${encodeURIComponent(targetDeviceId)}`, {
+    const res = await fetch(`/api/files/send?targetDeviceId=${encodeURIComponent(targetDeviceId)}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/octet-stream",
@@ -338,17 +425,113 @@ document.querySelector("#send-form").addEventListener("submit", async (event) =>
       body: file,
     });
 
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || "File transfer failed.");
-    }
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload.error || "File transfer failed.");
 
-    sendStatus.innerHTML = `<p class="success">${file.name} sent successfully.</p>`;
-    fileInput.value = "";
+    const hashMsg = payload.hashVerified === true
+      ? " · Integrity verified ✓"
+      : payload.hashVerified === false
+        ? " · ⚠ Hash mismatch!"
+        : "";
+    showStatus("success", `${file.name} sent successfully${hashMsg}`);
+    clearFileSelection();
   } catch (error) {
-    sendStatus.innerHTML = `<p class="error">${error.message}</p>`;
+    showStatus("error", error.message);
+  } finally {
+    sendBtn.disabled = false;
+    updateSendButton();
+    stopProgressPolling();
   }
 });
+
+// ── Nearby device pairing ──
+
+nearbyDevices.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-pair-target]");
+  if (!btn) return;
+  btn.disabled = true;
+  showStatus("info", "Sending connection request...");
+  try {
+    await postJson("/api/pair/request", { targetDeviceId: btn.dataset.pairTarget });
+    showStatus("success", "Request sent. The other device can approve now.");
+  } catch (error) {
+    showStatus("error", error.message);
+  }
+});
+
+// ── Connection request handling ──
+
+incomingRequests.addEventListener("click", async (e) => {
+  const btn = e.target.closest("[data-request-action]");
+  if (!btn) return;
+  const action = btn.dataset.requestAction;
+  const requestId = btn.dataset.requestId;
+  btn.disabled = true;
+  try {
+    await postJson(`/api/pair/${action}`, { requestId });
+    if (action === "approve") {
+      showStatus("info", "Approved. Connecting...");
+    }
+  } catch (error) {
+    showStatus("error", error.message);
+  }
+});
+
+// ── Host controls ──
+
+document.querySelector("#start-host").addEventListener("click", async () => {
+  showStatus("info", "Starting host session...");
+  try {
+    await postJson("/api/host/start");
+    showStatus("success", "Host session active.");
+  } catch (error) {
+    showStatus("error", error.message);
+  }
+});
+
+document.querySelector("#stop-host").addEventListener("click", async () => {
+  try {
+    await postJson("/api/host/stop");
+    showStatus("info", "Host session stopped.");
+  } catch (error) {
+    showStatus("error", error.message);
+  }
+});
+
+// ── Manual join ──
+
+document.querySelector("#join-session").addEventListener("click", async () => {
+  showStatus("info", "Joining session...");
+  try {
+    await postJson("/api/session/join", { inviteCode: inviteCodeInput.value.trim() });
+    showStatus("success", "Joined session successfully.");
+    inviteCodeInput.value = "";
+  } catch (error) {
+    showStatus("error", error.message);
+  }
+});
+
+// ── Theme Toggle ──
+
+const themeToggle = document.querySelector("#theme-toggle");
+const themeIcon = themeToggle.querySelector(".theme-icon");
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute("data-theme", theme);
+  themeIcon.textContent = theme === "dark" ? "🌙" : "☀️";
+  localStorage.setItem("lubdub-theme", theme);
+}
+
+themeToggle.addEventListener("click", () => {
+  const current = document.documentElement.getAttribute("data-theme");
+  applyTheme(current === "dark" ? "light" : "dark");
+});
+
+// Restore saved theme
+const savedTheme = localStorage.getItem("lubdub-theme") || "dark";
+applyTheme(savedTheme);
+
+// ── Polling ──
 
 fetchState();
 setInterval(fetchState, 3000);

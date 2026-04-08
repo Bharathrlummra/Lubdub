@@ -1,115 +1,153 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>LUBDUB Share</title>
+    <title>LUBDUB Share — Instant File Sharing</title>
+    <meta name="description" content="Share files between Windows PCs without internet, routers, or cables using Wi-Fi Direct." />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="shell">
-      <section class="hero">
-        <p class="eyebrow">Windows to Windows</p>
-        <h1>LUBDUB Share</h1>
-        <p class="lede">
-          Share files without internet, without a router, and without cables by creating a
-          temporary Wi-Fi Direct session between nearby PCs.
-        </p>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-icon" aria-hidden="true">
+          <span class="pulse-ring"></span>
+          <span class="pulse-dot"></span>
+        </div>
+        <h1>LUBDUB<span class="brand-tag">Share</span></h1>
+      </div>
+      <div class="device-badge" id="device-badge"></div>
+      <button id="theme-toggle" class="icon-btn" aria-label="Toggle theme" title="Toggle theme">
+        <span class="theme-icon">🌙</span>
+      </button>
+    </header>
+
+    <main class="app">
+      <section class="panel hero-panel">
+        <p class="hero-tagline">Drop a file. Send it instantly. No internet needed.</p>
       </section>
 
-      <section class="panel">
-        <h2>This Device</h2>
-        <div id="device-card" class="card-grid"></div>
-      </section>
-
-      <section class="two-up">
-        <div class="panel">
-          <h2>Host Session</h2>
-          <p class="muted">
-            This device becomes the session owner and exposes an invite code containing the Wi-Fi
-            Direct SSID and passphrase. You can also send a connect request from the nearby device
-            list and let the other PC approve it.
-          </p>
-          <div class="actions">
-            <button id="start-host">Start Session</button>
-            <button id="stop-host" class="secondary">Stop Session</button>
+      <div class="grid-two">
+        <section class="panel" id="panel-nearby">
+          <div class="panel-header">
+            <h2>Nearby Devices</h2>
+            <span class="counter" id="nearby-count">0</span>
           </div>
-          <div id="host-session" class="stack"></div>
-        </div>
+          <p class="hint">Both PCs must have LUBDUB open. Devices appear automatically.</p>
+          <div id="nearby-devices" class="card-stack"></div>
+        </section>
 
-        <div class="panel">
-          <h2>Join Session</h2>
-          <p class="muted">
-            Paste the invite code from the host device. The app will connect to the Wi-Fi Direct
-            network, find the host, and register this PC. If the other device sends a connection
-            request, approving it below will connect automatically.
-          </p>
-          <textarea
-            id="invite-code"
-            rows="6"
-            placeholder="Paste invite code from the host device"
-          ></textarea>
-          <div class="actions">
-            <button id="join-session">Join Session</button>
+        <section class="panel" id="panel-requests">
+          <div class="panel-header">
+            <h2>Connection Requests</h2>
+            <span class="counter" id="request-count">0</span>
           </div>
-          <div id="join-status" class="stack"></div>
+          <p class="hint">Approve incoming requests to connect via Wi-Fi Direct.</p>
+          <div id="incoming-requests" class="card-stack"></div>
+        </section>
+      </div>
+
+      <section class="panel" id="panel-connection">
+        <div class="panel-header">
+          <h2>Connection Status</h2>
+          <span class="status-pill" id="connection-pill">Idle</span>
+        </div>
+        <div id="connection-status" class="card-stack"></div>
+
+        <details class="manual-join">
+          <summary>Manual join with invite code</summary>
+          <div class="manual-join-body">
+            <textarea id="invite-code" rows="3" placeholder="Paste invite code from the host device"></textarea>
+            <button id="join-session" class="btn btn-secondary">Join Session</button>
+          </div>
+        </details>
+      </section>
+
+      <section class="panel" id="panel-transfer">
+        <div class="panel-header">
+          <h2>Send File</h2>
+        </div>
+
+        <div class="transfer-zone" id="transfer-zone">
+          <div class="drop-zone" id="drop-zone">
+            <div class="drop-icon">📁</div>
+            <p class="drop-label">Drop a file here or <label for="file-input" class="file-link">browse</label></p>
+            <input id="file-input" type="file" class="file-input-hidden" />
+          </div>
+
+          <div class="file-selected" id="file-selected" hidden>
+            <div class="file-info">
+              <span class="file-name" id="selected-file-name"></span>
+              <span class="file-size" id="selected-file-size"></span>
+            </div>
+            <button id="clear-file" class="btn-icon" title="Clear selection">✕</button>
+          </div>
+
+          <div class="send-controls">
+            <label class="target-label">
+              <span>Target</span>
+              <select id="target-device"></select>
+            </label>
+            <button id="send-btn" class="btn btn-primary btn-send" disabled>Send</button>
+          </div>
+
+          <div class="progress-container" id="progress-container" hidden>
+            <div class="progress-header">
+              <span class="progress-phase" id="progress-phase">Caching...</span>
+              <span class="progress-pct" id="progress-pct">0%</span>
+            </div>
+            <div class="progress-track">
+              <div class="progress-fill" id="progress-fill"></div>
+            </div>
+            <div class="progress-meta">
+              <span id="progress-speed"></span>
+              <span id="progress-detail"></span>
+            </div>
+          </div>
+
+          <div class="send-status" id="send-status"></div>
         </div>
       </section>
 
-      <section class="two-up">
-        <div class="panel">
-          <h2>Nearby Devices</h2>
-          <p class="muted">
-            Devices on the same local network can receive a ShareIt-style connection request from
-            here.
-          </p>
-          <div id="nearby-devices" class="stack"></div>
-        </div>
+      <div class="grid-two">
+        <section class="panel" id="panel-received">
+          <div class="panel-header">
+            <h2>Received Files</h2>
+            <span class="counter" id="received-count">0</span>
+          </div>
+          <div id="received" class="card-stack"></div>
+        </section>
 
-        <div class="panel">
-          <h2>Connection Requests</h2>
-          <p class="muted">
-            When another device asks to connect, approve it here and this PC will join
-            automatically.
-          </p>
-          <div id="incoming-requests" class="stack"></div>
-        </div>
+        <section class="panel" id="panel-peers">
+          <div class="panel-header">
+            <h2>Connected Peers</h2>
+          </div>
+          <div id="peers" class="card-stack"></div>
+        </section>
+      </div>
+
+      <section class="panel collapsible">
+        <details>
+          <summary class="panel-header clickable">
+            <h2>Diagnostics</h2>
+          </summary>
+          <p class="hint">Recent connection and transfer logs. Also saved in <code>runtime/lubdub-debug.log</code>.</p>
+          <div id="diagnostics" class="card-stack"></div>
+        </details>
       </section>
 
-      <section class="panel">
-        <h2>Send File</h2>
-        <form id="send-form" class="send-form">
-          <label>
-            Target device
-            <select id="target-device"></select>
-          </label>
-          <label>
-            File
-            <input id="file-input" type="file" />
-          </label>
-          <button type="submit">Send</button>
-        </form>
-        <div id="send-status" class="stack"></div>
-      </section>
-
-      <section class="two-up">
-        <div class="panel">
-          <h2>Connected Peers</h2>
-          <div id="peers" class="stack"></div>
-        </div>
-        <div class="panel">
-          <h2>Received Files</h2>
-          <div id="received" class="stack"></div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <h2>Diagnostics</h2>
-        <p class="muted">
-          Recent connection logs from this device. These are also saved in
-          <code>runtime/lubdub-debug.log</code>.
-        </p>
-        <div id="diagnostics" class="stack"></div>
+      <section class="panel collapsible">
+        <details>
+          <summary class="panel-header clickable">
+            <h2>Host Controls</h2>
+          </summary>
+          <p class="hint">Manually start or stop a Wi-Fi Direct host session.</p>
+          <div class="host-controls">
+            <button id="start-host" class="btn btn-secondary">Start Host</button>
+            <button id="stop-host" class="btn btn-outline">Stop Host</button>
+          </div>
+          <div id="host-session" class="card-stack"></div>
+        </details>
       </section>
     </main>
 

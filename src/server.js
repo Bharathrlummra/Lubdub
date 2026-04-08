@@ -6,6 +6,7 @@ const path = require("node:path");
 const os = require("node:os");
 const crypto = require("node:crypto");
 const { pipeline } = require("node:stream/promises");
+const { Transform } = require("node:stream");
 
 const {
   joinHostedNetwork,
@@ -23,6 +24,7 @@ const {
 const { discoverHost: scanForHost } = require("./networkDiscovery");
 const { createNearbyDiscovery } = require("./nearbyDiscovery");
 const { createWiFiDirectDiscovery } = require("./wifiDirectDiscovery");
+const { computeFileHash } = require("./fileHash");
 
 const ROOT = path.resolve(__dirname, "..");
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -52,6 +54,7 @@ const state = {
   receivedFiles: [],
   diagnostics: [],
   incomingTransfers: new Map(),
+  activeTransfer: null,
 };
 
 const services = {
@@ -95,6 +98,25 @@ async function ensureDirectories() {
   await fsp.mkdir(OUTGOING_TRANSFER_DIR, { recursive: true });
   await fsp.mkdir(INCOMING_TRANSFER_DIR, { recursive: true });
   await fsp.appendFile(LOG_FILE, "", "utf8");
+}
+
+async function cleanupStaleRuntimeFiles() {
+  try {
+    const entries = await fsp.readdir(RUNTIME_DIR);
+    const stalePattern = /^wifi-direct-.*\.(json|stop)$/;
+    let removed = 0;
+    for (const entry of entries) {
+      if (stalePattern.test(entry)) {
+        await fsp.rm(path.join(RUNTIME_DIR, entry), { force: true });
+        removed += 1;
+      }
+    }
+    if (removed > 0) {
+      console.log(`[LUBDUB] Cleaned up ${removed} stale session file(s).`);
+    }
+  } catch {
+    // Best-effort cleanup.
+  }
 }
 
 function pushDiagnostic(event, details = {}) {
@@ -418,6 +440,7 @@ async function persistIncomingTransferState(session) {
     lastModified: session.lastModified,
     chunkSize: session.chunkSize,
     totalChunks: session.totalChunks,
+    fileHash: session.fileHash || null,
     storedName: session.storedName,
     savedPath: session.savedPath,
     partialPath: session.partialPath,
@@ -489,6 +512,7 @@ async function createIncomingTransferSession(manifest) {
     lastModified: manifest.lastModified,
     chunkSize: manifest.chunkSize,
     totalChunks: manifest.totalChunks,
+    fileHash: manifest.fileHash || null,
     storedName,
     savedPath,
     partialPath,
@@ -526,6 +550,7 @@ async function loadIncomingTransferSession(manifest) {
     lastModified: persisted.lastModified,
     chunkSize: persisted.chunkSize,
     totalChunks: persisted.totalChunks,
+    fileHash: persisted.fileHash || null,
     storedName: persisted.storedName,
     savedPath: persisted.savedPath,
     partialPath,
@@ -675,6 +700,28 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
   await fsp.rm(session.statePath, { force: true });
   state.incomingTransfers.delete(fileId);
 
+  let hashVerified = null;
+  if (session.fileHash) {
+    try {
+      const receivedHash = await computeFileHash(session.savedPath);
+      hashVerified = receivedHash === session.fileHash;
+      pushDiagnostic("transfer.chunk.hash.verify", {
+        transferId,
+        fileId,
+        originalName: session.originalName,
+        expectedHash: session.fileHash.slice(0, 16) + "...",
+        receivedHash: receivedHash.slice(0, 16) + "...",
+        verified: hashVerified,
+      });
+    } catch (error) {
+      pushDiagnostic("transfer.chunk.hash.error", {
+        transferId,
+        fileId,
+        message: error.message,
+      });
+    }
+  }
+
   state.receivedFiles.unshift({
     id: transferId,
     originalName: session.originalName,
@@ -682,6 +729,7 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
     savedPath: session.savedPath,
     senderName: session.senderName || "Unknown device",
     size: session.size,
+    hashVerified,
     receivedAt: new Date().toISOString(),
   });
 
@@ -692,12 +740,14 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
     savedPath: session.savedPath,
     size: session.size,
     senderName: session.senderName,
+    hashVerified,
   });
 
   return {
     ok: true,
     savedPath: session.savedPath,
     size: session.size,
+    hashVerified,
   };
 }
 
@@ -797,6 +847,12 @@ async function completePeerTransfer(target, transferId, fileId) {
   return response.json();
 }
 
+function getAdaptiveChunkSize(fileSize) {
+  if (fileSize < 10 * 1024 * 1024) return 256 * 1024;
+  if (fileSize > 500 * 1024 * 1024) return 4 * 1024 * 1024;
+  return DEFAULT_CHUNK_SIZE;
+}
+
 async function handleFileSend(request, response, url) {
   const targetDeviceId = url.searchParams.get("targetDeviceId");
   if (!targetDeviceId) {
@@ -820,7 +876,7 @@ async function handleFileSend(request, response, url) {
     return;
   }
 
-  const chunkSize = DEFAULT_CHUNK_SIZE;
+  const chunkSize = getAdaptiveChunkSize(size);
   const totalChunks = getChunkCount(size, chunkSize);
   const fileId = createChunkedFileId({
     senderDeviceId: state.deviceId,
@@ -842,18 +898,56 @@ async function handleFileSend(request, response, url) {
     sentAt: new Date().toISOString(),
   };
 
+  state.activeTransfer = {
+    transferId,
+    originalName,
+    size,
+    phase: "caching",
+    bytesCached: 0,
+    chunksSent: 0,
+    totalChunks,
+    startedAt: Date.now(),
+    error: null,
+    fileHash: null,
+    hashVerified: null,
+  };
+
   pushDiagnostic("transfer.chunk.cache.start", {
     transferId,
     fileId,
     originalName,
     size,
+    chunkSize,
     outgoingPath,
   });
-  await pipeline(request, fs.createWriteStream(outgoingPath));
+
+  const hashDigest = crypto.createHash("sha256");
+  let bytesCached = 0;
+  const tracker = new Transform({
+    transform(chunk, encoding, callback) {
+      bytesCached += chunk.length;
+      hashDigest.update(chunk);
+      if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+        state.activeTransfer.bytesCached = bytesCached;
+      }
+      callback(null, chunk);
+    },
+  });
+
+  await pipeline(request, tracker, fs.createWriteStream(outgoingPath));
+  const fileHash = hashDigest.digest("hex");
+  manifest.fileHash = fileHash;
+
   const outgoingStats = await fsp.stat(outgoingPath);
   if (outgoingStats.size !== size) {
+    state.activeTransfer = null;
     await fsp.rm(outgoingPath, { force: true });
     throw new Error(`Upload caching mismatch. Expected ${size} bytes, received ${outgoingStats.size}.`);
+  }
+
+  if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+    state.activeTransfer.phase = "transferring";
+    state.activeTransfer.fileHash = fileHash;
   }
 
   pushDiagnostic("transfer.chunk.cache.complete", {
@@ -862,36 +956,102 @@ async function handleFileSend(request, response, url) {
     originalName,
     size,
     outgoingPath,
+    fileHash: fileHash.slice(0, 16) + "...",
   });
 
+  const MAX_TRANSFER_RETRIES = 3;
+  let lastError = null;
+  let transferResult = null;
+
   try {
-    const preparedTransfer = await preparePeerTransfer(target, manifest);
-    pushDiagnostic("transfer.chunk.resume", {
-      transferId,
-      fileId,
-      originalName,
-      pendingChunks: preparedTransfer.pendingChunks.length,
-      totalChunks: preparedTransfer.totalChunks,
-      laneCount: Math.min(DEFAULT_TRANSFER_LANES, Math.max(preparedTransfer.pendingChunks.length, 1)),
-    });
+    for (let attempt = 1; attempt <= MAX_TRANSFER_RETRIES; attempt++) {
+      try {
+        const preparedTransfer = await preparePeerTransfer(target, manifest);
 
-    await sendChunkedTransfer({
-      host: target.ip,
-      port: preparedTransfer.transferPort || target.transferPort || getTransferPort(target.port || PORT),
-      manifest,
-      sourcePath: outgoingPath,
-      pendingChunks: preparedTransfer.pendingChunks,
-      laneCount: Math.min(
-        DEFAULT_TRANSFER_LANES,
-        Math.max(preparedTransfer.pendingChunks.length, 1),
-      ),
-      onDiagnostic: (event, details) => pushDiagnostic(event, details),
-    });
+        if (preparedTransfer.pendingChunks.length === 0) {
+          transferResult = await completePeerTransfer(target, transferId, fileId);
+          break;
+        }
 
-    const completedTransfer = await completePeerTransfer(target, transferId, fileId);
-    json(response, 200, completedTransfer);
+        const laneCount = Math.min(
+          DEFAULT_TRANSFER_LANES,
+          Math.max(preparedTransfer.pendingChunks.length, 1),
+        );
+
+        if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+          state.activeTransfer.chunksSent = totalChunks - preparedTransfer.pendingChunks.length;
+        }
+
+        pushDiagnostic("transfer.chunk.resume", {
+          transferId,
+          fileId,
+          originalName,
+          pendingChunks: preparedTransfer.pendingChunks.length,
+          totalChunks: preparedTransfer.totalChunks,
+          laneCount,
+          attempt,
+        });
+
+        await sendChunkedTransfer({
+          host: target.ip,
+          port: preparedTransfer.transferPort || target.transferPort || getTransferPort(target.port || PORT),
+          manifest,
+          sourcePath: outgoingPath,
+          pendingChunks: preparedTransfer.pendingChunks,
+          laneCount,
+          onChunkSent: () => {
+            if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+              state.activeTransfer.chunksSent += 1;
+            }
+          },
+          onDiagnostic: (event, details) => pushDiagnostic(event, details),
+        });
+
+        if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+          state.activeTransfer.phase = "verifying";
+        }
+
+        transferResult = await completePeerTransfer(target, transferId, fileId);
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        pushDiagnostic("transfer.chunk.retry", {
+          transferId,
+          fileId,
+          originalName,
+          attempt,
+          maxAttempts: MAX_TRANSFER_RETRIES,
+          message: error.message,
+        });
+
+        if (attempt < MAX_TRANSFER_RETRIES) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
+      }
+    }
+
+    if (lastError && !transferResult) {
+      if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+        state.activeTransfer.phase = "error";
+        state.activeTransfer.error = lastError.message;
+      }
+      throw lastError;
+    }
+
+    if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+      state.activeTransfer.phase = "complete";
+      state.activeTransfer.hashVerified = transferResult.hashVerified || null;
+    }
+
+    json(response, 200, transferResult);
   } finally {
     await fsp.rm(outgoingPath, { force: true }).catch(() => {});
+    setTimeout(() => {
+      if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
+        state.activeTransfer = null;
+      }
+    }, 8000);
   }
 }
 
@@ -1443,6 +1603,28 @@ async function route(request, response) {
       return;
     }
 
+    if (request.method === "GET" && url.pathname === "/api/transfer/progress") {
+      json(response, 200, {
+        active: state.activeTransfer !== null,
+        transfer: state.activeTransfer
+          ? {
+              transferId: state.activeTransfer.transferId,
+              originalName: state.activeTransfer.originalName,
+              size: state.activeTransfer.size,
+              phase: state.activeTransfer.phase,
+              bytesCached: state.activeTransfer.bytesCached,
+              chunksSent: state.activeTransfer.chunksSent,
+              totalChunks: state.activeTransfer.totalChunks,
+              startedAt: state.activeTransfer.startedAt,
+              error: state.activeTransfer.error,
+              fileHash: state.activeTransfer.fileHash,
+              hashVerified: state.activeTransfer.hashVerified,
+            }
+          : null,
+      });
+      return;
+    }
+
     if (request.method === "POST" && url.pathname === "/api/host/start") {
       await handleHostStart(response);
       return;
@@ -1533,6 +1715,7 @@ async function route(request, response) {
 
 async function main() {
   await ensureDirectories();
+  await cleanupStaleRuntimeFiles();
   state.deviceId = await getOrCreateDeviceId();
   pushDiagnostic("app.start", {
     deviceId: state.deviceId,

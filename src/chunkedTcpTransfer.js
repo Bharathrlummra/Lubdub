@@ -165,6 +165,7 @@ async function sendChunkedTransfer({
   sourcePath,
   pendingChunks,
   laneCount = DEFAULT_TRANSFER_LANES,
+  onChunkSent = () => {},
   onDiagnostic = () => {},
 }) {
   const fileHandle = await fs.open(sourcePath, "r");
@@ -221,6 +222,7 @@ async function sendChunkedTransfer({
         );
         await writeSocket(socket, body);
         bytesSent += length;
+        onChunkSent({ chunkIndex, length, laneId });
       }
 
       socket.end(
