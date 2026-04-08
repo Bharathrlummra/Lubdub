@@ -42,6 +42,7 @@ const LOG_FILE = path.join(RUNTIME_DIR, "lubdub-debug.log");
 const MAX_JSON_BYTES = 256 * 1024;
 const NEARBY_DEVICE_STALE_MS = 12000;
 const MAX_DIAGNOSTIC_ENTRIES = 40;
+const MAX_TRANSFER_RETRIES = 3;
 
 const state = {
   deviceId: "",
@@ -85,6 +86,10 @@ function json(response, statusCode, payload) {
 
 function stripIpv6Prefix(address) {
   return address.replace(/^::ffff:/, "");
+}
+
+function elapsedMs(startedAtMs) {
+  return Math.max(0, Date.now() - startedAtMs);
 }
 
 function getRole() {
@@ -323,6 +328,7 @@ async function readErrorResponse(upstream) {
 }
 
 async function registerWithHost(hostIp, sessionId, port) {
+  const startedAtMs = Date.now();
   pushDiagnostic("register.start", { hostIp, port, sessionId });
   const response = await fetch(`http://${hostIp}:${port}/api/session/register`, {
     method: "POST",
@@ -342,11 +348,22 @@ async function registerWithHost(hostIp, sessionId, port) {
 
   if (!response.ok) {
     const message = await readErrorResponse(response);
-    pushDiagnostic("register.error", { hostIp, port, sessionId, message });
+    pushDiagnostic("register.error", {
+      hostIp,
+      port,
+      sessionId,
+      message,
+      durationMs: elapsedMs(startedAtMs),
+    });
     throw new Error(message);
   }
 
-  pushDiagnostic("register.success", { hostIp, port, sessionId });
+  pushDiagnostic("register.success", {
+    hostIp,
+    port,
+    sessionId,
+    durationMs: elapsedMs(startedAtMs),
+  });
   return response.json();
 }
 
@@ -425,7 +442,8 @@ function isCompatibleIncomingTransfer(session, manifest) {
     session.senderDeviceId === manifest.senderDeviceId &&
     session.originalName === manifest.originalName &&
     session.size === manifest.size &&
-    session.chunkSize === manifest.chunkSize
+    session.chunkSize === manifest.chunkSize &&
+    (session.fileHash || null) === (manifest.fileHash || null)
   );
 }
 
@@ -457,7 +475,7 @@ async function flushIncomingTransferState(session) {
     return;
   }
 
-  await session.writeQueue;
+  await Promise.all(Array.from(session.laneWriteQueues.values()));
   if (session.dirtyChunkCount === 0) {
     return;
   }
@@ -465,9 +483,20 @@ async function flushIncomingTransferState(session) {
   await persistIncomingTransferState(session);
 }
 
-function queueIncomingTransferWrite(session, operation) {
-  const nextWrite = session.writeQueue.then(operation);
-  session.writeQueue = nextWrite.catch(() => {});
+async function getIncomingLaneHandle(session, laneId) {
+  if (session.laneFileHandles.has(laneId)) {
+    return session.laneFileHandles.get(laneId);
+  }
+
+  const handle = await fsp.open(session.partialPath, "r+");
+  session.laneFileHandles.set(laneId, handle);
+  return handle;
+}
+
+function queueIncomingTransferWrite(session, laneId, operation) {
+  const currentQueue = session.laneWriteQueues.get(laneId) || Promise.resolve();
+  const nextWrite = currentQueue.then(operation);
+  session.laneWriteQueues.set(laneId, nextWrite.catch(() => {}));
   return nextWrite;
 }
 
@@ -477,7 +506,13 @@ async function closeIncomingTransferSession(session) {
   }
 
   session.closed = true;
-  await session.writeQueue;
+  await Promise.all(Array.from(session.laneWriteQueues.values()));
+  await Promise.all(
+    Array.from(session.laneFileHandles.values()).map((handle) =>
+      handle.close().catch(() => {}),
+    ),
+  );
+  session.laneFileHandles.clear();
   await session.fileHandle.close();
 }
 
@@ -518,9 +553,11 @@ async function createIncomingTransferSession(manifest) {
     partialPath,
     statePath,
     fileHandle,
+    startedAtMs: Date.now(),
     completedChunks: new Set(),
     dirtyChunkCount: 0,
-    writeQueue: Promise.resolve(),
+    laneWriteQueues: new Map(),
+    laneFileHandles: new Map(),
     closed: false,
   };
 
@@ -556,9 +593,11 @@ async function loadIncomingTransferSession(manifest) {
     partialPath,
     statePath,
     fileHandle: await fsp.open(partialPath, "r+"),
+    startedAtMs: Date.now(),
     completedChunks: new Set(completedChunks),
     dirtyChunkCount: 0,
-    writeQueue: Promise.resolve(),
+    laneWriteQueues: new Map(),
+    laneFileHandles: new Map(),
     closed: false,
   };
 
@@ -636,9 +675,10 @@ async function recordIncomingChunk(chunkHeader, body) {
     throw new Error(`Chunk ${chunkHeader.chunkIndex} exceeds the expected file size.`);
   }
 
-  await queueIncomingTransferWrite(session, async () => {
+  await queueIncomingTransferWrite(session, chunkHeader.laneId || 0, async () => {
     if (!session.completedChunks.has(chunkHeader.chunkIndex)) {
-      const { bytesWritten } = await session.fileHandle.write(
+      const laneHandle = await getIncomingLaneHandle(session, chunkHeader.laneId || 0);
+      const { bytesWritten } = await laneHandle.write(
         body,
         0,
         body.length,
@@ -652,10 +692,6 @@ async function recordIncomingChunk(chunkHeader, body) {
 
       session.completedChunks.add(chunkHeader.chunkIndex);
       session.dirtyChunkCount += 1;
-
-      if (session.dirtyChunkCount >= 16) {
-        await persistIncomingTransferState(session);
-      }
     }
   });
 }
@@ -696,14 +732,12 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
   }
 
   await closeIncomingTransferSession(session);
-  await fsp.rename(session.partialPath, session.savedPath);
-  await fsp.rm(session.statePath, { force: true });
   state.incomingTransfers.delete(fileId);
 
   let hashVerified = null;
   if (session.fileHash) {
     try {
-      const receivedHash = await computeFileHash(session.savedPath);
+      const receivedHash = await computeFileHash(session.partialPath);
       hashVerified = receivedHash === session.fileHash;
       pushDiagnostic("transfer.chunk.hash.verify", {
         transferId,
@@ -719,8 +753,34 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
         fileId,
         message: error.message,
       });
+      throw error;
     }
   }
+
+  if (hashVerified === false) {
+    await fsp.rm(session.partialPath, { force: true }).catch(() => {});
+    await fsp.rm(session.statePath, { force: true }).catch(() => {});
+
+    pushDiagnostic("transfer.chunk.receive.failed", {
+      transferId,
+      fileId,
+      originalName: session.originalName,
+      senderName: session.senderName,
+      reason: "hash_mismatch",
+      durationMs: elapsedMs(session.startedAtMs),
+    });
+
+    return {
+      ok: false,
+      code: "HASH_MISMATCH",
+      retryable: false,
+      error: "Received file failed integrity verification.",
+      hashVerified: false,
+    };
+  }
+
+  await fsp.rename(session.partialPath, session.savedPath);
+  await fsp.rm(session.statePath, { force: true });
 
   state.receivedFiles.unshift({
     id: transferId,
@@ -741,6 +801,7 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
     size: session.size,
     senderName: session.senderName,
     hashVerified,
+    durationMs: elapsedMs(session.startedAtMs),
   });
 
   return {
@@ -812,6 +873,7 @@ async function handleFileReceive(request, response) {
 }
 
 async function preparePeerTransfer(target, manifest) {
+  const startedAtMs = Date.now();
   const response = await fetch(`http://${target.ip}:${target.port}/api/transfers/prepare`, {
     method: "POST",
     headers: {
@@ -824,10 +886,21 @@ async function preparePeerTransfer(target, manifest) {
     throw new Error(await readErrorResponse(response));
   }
 
-  return response.json();
+  const payload = await response.json();
+  pushDiagnostic("transfer.chunk.prepare.remote", {
+    transferId: manifest.transferId,
+    fileId: manifest.fileId,
+    targetHost: target.ip,
+    targetPort: target.port,
+    pendingChunks: payload.pendingChunks?.length || 0,
+    totalChunks: payload.totalChunks || manifest.totalChunks,
+    durationMs: elapsedMs(startedAtMs),
+  });
+  return payload;
 }
 
 async function completePeerTransfer(target, transferId, fileId) {
+  const startedAtMs = Date.now();
   const response = await fetch(`http://${target.ip}:${target.port}/api/transfers/complete`, {
     method: "POST",
     headers: {
@@ -839,21 +912,57 @@ async function completePeerTransfer(target, transferId, fileId) {
     }),
   });
 
+  const payload = await response.json().catch(async () => ({
+    error: await response.text(),
+  }));
+
   if (!response.ok) {
-    const message = await readErrorResponse(response);
-    throw new Error(message);
+    const error = new Error(
+      payload.error || payload.message || `Request failed with status ${response.status}.`,
+    );
+    error.code = payload.code || `HTTP_${response.status}`;
+    error.retryable = payload.retryable !== false;
+    throw error;
   }
 
-  return response.json();
+  pushDiagnostic("transfer.chunk.complete.remote", {
+    transferId,
+    fileId,
+    targetHost: target.ip,
+    targetPort: target.port,
+    hashVerified: payload.hashVerified ?? null,
+    durationMs: elapsedMs(startedAtMs),
+  });
+
+  return payload;
 }
 
 function getAdaptiveChunkSize(fileSize) {
   if (fileSize < 10 * 1024 * 1024) return 256 * 1024;
-  if (fileSize > 500 * 1024 * 1024) return 4 * 1024 * 1024;
-  return DEFAULT_CHUNK_SIZE;
+  if (fileSize < 100 * 1024 * 1024) return Math.max(DEFAULT_CHUNK_SIZE, 1024 * 1024);
+  if (fileSize < 750 * 1024 * 1024) return 4 * 1024 * 1024;
+  if (fileSize < 2 * 1024 * 1024 * 1024) return 8 * 1024 * 1024;
+  return 16 * 1024 * 1024;
+}
+
+function getAdaptiveLaneCount(fileSize, pendingChunkCount) {
+  if (fileSize < 100 * 1024 * 1024) {
+    return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 2, pendingChunkCount));
+  }
+
+  if (fileSize < 750 * 1024 * 1024) {
+    return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 4, pendingChunkCount));
+  }
+
+  if (fileSize < 2 * 1024 * 1024 * 1024) {
+    return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 6, pendingChunkCount));
+  }
+
+  return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 8, pendingChunkCount));
 }
 
 async function handleFileSend(request, response, url) {
+  const transferStartedAtMs = Date.now();
   const targetDeviceId = url.searchParams.get("targetDeviceId");
   if (!targetDeviceId) {
     json(response, 400, { error: "targetDeviceId is required." });
@@ -923,6 +1032,7 @@ async function handleFileSend(request, response, url) {
 
   const hashDigest = crypto.createHash("sha256");
   let bytesCached = 0;
+  const cacheStartedAtMs = Date.now();
   const tracker = new Transform({
     transform(chunk, encoding, callback) {
       bytesCached += chunk.length;
@@ -957,26 +1067,37 @@ async function handleFileSend(request, response, url) {
     size,
     outgoingPath,
     fileHash: fileHash.slice(0, 16) + "...",
+    durationMs: elapsedMs(cacheStartedAtMs),
   });
 
-  const MAX_TRANSFER_RETRIES = 3;
   let lastError = null;
   let transferResult = null;
 
   try {
     for (let attempt = 1; attempt <= MAX_TRANSFER_RETRIES; attempt++) {
+      const attemptStartedAtMs = Date.now();
       try {
+        const prepareStartedAtMs = Date.now();
         const preparedTransfer = await preparePeerTransfer(target, manifest);
+        const prepareDurationMs = elapsedMs(prepareStartedAtMs);
 
         if (preparedTransfer.pendingChunks.length === 0) {
+          const completeStartedAtMs = Date.now();
           transferResult = await completePeerTransfer(target, transferId, fileId);
+          pushDiagnostic("transfer.chunk.attempt.complete", {
+            transferId,
+            fileId,
+            originalName,
+            attempt,
+            prepareDurationMs,
+            sendDurationMs: 0,
+            verifyDurationMs: elapsedMs(completeStartedAtMs),
+            durationMs: elapsedMs(attemptStartedAtMs),
+          });
           break;
         }
 
-        const laneCount = Math.min(
-          DEFAULT_TRANSFER_LANES,
-          Math.max(preparedTransfer.pendingChunks.length, 1),
-        );
+        const laneCount = getAdaptiveLaneCount(size, preparedTransfer.pendingChunks.length);
 
         if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
           state.activeTransfer.chunksSent = totalChunks - preparedTransfer.pendingChunks.length;
@@ -990,8 +1111,10 @@ async function handleFileSend(request, response, url) {
           totalChunks: preparedTransfer.totalChunks,
           laneCount,
           attempt,
+          prepareDurationMs,
         });
 
+        const sendStartedAtMs = Date.now();
         await sendChunkedTransfer({
           host: target.ip,
           port: preparedTransfer.transferPort || target.transferPort || getTransferPort(target.port || PORT),
@@ -1006,12 +1129,26 @@ async function handleFileSend(request, response, url) {
           },
           onDiagnostic: (event, details) => pushDiagnostic(event, details),
         });
+        const sendDurationMs = elapsedMs(sendStartedAtMs);
 
         if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
           state.activeTransfer.phase = "verifying";
         }
 
+        const completeStartedAtMs = Date.now();
         transferResult = await completePeerTransfer(target, transferId, fileId);
+        const verifyDurationMs = elapsedMs(completeStartedAtMs);
+        pushDiagnostic("transfer.chunk.attempt.complete", {
+          transferId,
+          fileId,
+          originalName,
+          attempt,
+          prepareDurationMs,
+          sendDurationMs,
+          verifyDurationMs,
+          durationMs: elapsedMs(attemptStartedAtMs),
+          hashVerified: transferResult.hashVerified ?? null,
+        });
         lastError = null;
         break;
       } catch (error) {
@@ -1023,7 +1160,13 @@ async function handleFileSend(request, response, url) {
           attempt,
           maxAttempts: MAX_TRANSFER_RETRIES,
           message: error.message,
+          retryable: error.retryable !== false,
+          durationMs: elapsedMs(attemptStartedAtMs),
         });
+
+        if (error.retryable === false) {
+          break;
+        }
 
         if (attempt < MAX_TRANSFER_RETRIES) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -1041,8 +1184,17 @@ async function handleFileSend(request, response, url) {
 
     if (state.activeTransfer && state.activeTransfer.transferId === transferId) {
       state.activeTransfer.phase = "complete";
-      state.activeTransfer.hashVerified = transferResult.hashVerified || null;
+      state.activeTransfer.hashVerified = transferResult.hashVerified ?? null;
     }
+
+    pushDiagnostic("transfer.chunk.complete", {
+      transferId,
+      fileId,
+      originalName,
+      size,
+      hashVerified: transferResult.hashVerified ?? null,
+      durationMs: elapsedMs(transferStartedAtMs),
+    });
 
     json(response, 200, transferResult);
   } finally {
@@ -1056,10 +1208,12 @@ async function handleFileSend(request, response, url) {
 }
 
 async function ensureHostedSession() {
+  const startedAtMs = Date.now();
   if (state.hostedSession) {
     pushDiagnostic("host.reuse", {
       sessionId: state.hostedSession.sessionId,
       ssid: state.hostedSession.ssid,
+      durationMs: elapsedMs(startedAtMs),
     });
     return {
       created: false,
@@ -1081,6 +1235,7 @@ async function ensureHostedSession() {
 }
 
 async function startPreparedHostedSession(session) {
+  const startedAtMs = Date.now();
   pushDiagnostic("host.starting", {
     sessionId: session.sessionId,
     ssid: session.ssid,
@@ -1114,12 +1269,14 @@ async function startPreparedHostedSession(session) {
     ssid: session.ssid,
     status: hostedStatus?.status || null,
     message: hostedStatus?.message || null,
+    durationMs: elapsedMs(startedAtMs),
   });
 
   return hostedStatus || readHostedStatus(session.statusFile);
 }
 
 async function joinSessionFromInviteCode(inviteCode) {
+  const joinStartedAtMs = Date.now();
   if (!inviteCode) {
     throw new Error("inviteCode is required.");
   }
@@ -1141,6 +1298,7 @@ async function joinSessionFromInviteCode(inviteCode) {
   });
 
   try {
+    const networkJoinStartedAtMs = Date.now();
     const joinResult = await joinHostedNetwork({
       ssid: invitePayload.ssid,
       passphrase: invitePayload.passphrase,
@@ -1151,18 +1309,22 @@ async function joinSessionFromInviteCode(inviteCode) {
       sessionId: invitePayload.sessionId,
       ssid: invitePayload.ssid,
       result: joinResult.stdout || null,
+      durationMs: elapsedMs(networkJoinStartedAtMs),
     });
   } catch (error) {
     pushDiagnostic("join.network.error", {
       sessionId: invitePayload.sessionId,
       ssid: invitePayload.ssid,
       message: error.message,
+      durationMs: elapsedMs(joinStartedAtMs),
     });
     throw error;
   }
 
   const discoveryEvents = [];
   let discoveredHost = null;
+  let discoveryMethod = "udp";
+  const discoveryStartedAtMs = Date.now();
 
   if (services.wifiDirectDiscovery) {
     discoveredHost = await services.wifiDirectDiscovery.discoverHost({
@@ -1176,9 +1338,11 @@ async function joinSessionFromInviteCode(inviteCode) {
   }
 
   if (!discoveredHost) {
+    discoveryMethod = "fallback-probe";
     pushDiagnostic("join.discovery.fallback.start", {
       sessionId: invitePayload.sessionId,
       ssid: invitePayload.ssid,
+      elapsedBeforeFallbackMs: elapsedMs(discoveryStartedAtMs),
     });
 
     discoveredHost = await scanForHost({
@@ -1206,7 +1370,11 @@ async function joinSessionFromInviteCode(inviteCode) {
     sessionId: invitePayload.sessionId,
     ssid: invitePayload.ssid,
     hostIp: discoveredHost.ip,
+    method: discoveryMethod,
+    durationMs: elapsedMs(discoveryStartedAtMs),
   });
+
+  const registerStartedAtMs = Date.now();
   const registrationPayload = await registerWithHost(
     discoveredHost.ip,
     invitePayload.sessionId,
@@ -1229,10 +1397,14 @@ async function joinSessionFromInviteCode(inviteCode) {
     sessionId: invitePayload.sessionId,
     ssid: invitePayload.ssid,
     hostIp: discoveredHost.ip,
+    discoveryMethod,
+    registerDurationMs: elapsedMs(registerStartedAtMs),
+    durationMs: elapsedMs(joinStartedAtMs),
   });
 }
 
 async function completeApprovedPairRequest(requestId) {
+  const startedAtMs = Date.now();
   const pendingRequest = state.connectionRequests.get(requestId);
   if (!pendingRequest || pendingRequest.status !== "joining") {
     return;
@@ -1251,6 +1423,7 @@ async function completeApprovedPairRequest(requestId) {
       requestId,
       sessionId: pendingRequest.sessionId,
       ssid: pendingRequest.ssid,
+      durationMs: elapsedMs(startedAtMs),
     });
   } catch (error) {
     const latestRequest = state.connectionRequests.get(requestId);
@@ -1265,6 +1438,7 @@ async function completeApprovedPairRequest(requestId) {
       sessionId: latestRequest.sessionId,
       ssid: latestRequest.ssid,
       message: error.message,
+      durationMs: elapsedMs(startedAtMs),
     });
   }
 }
@@ -1296,6 +1470,7 @@ async function handleSessionJoin(request, response) {
 }
 
 async function handlePairRequest(request, response) {
+  const pairStartedAtMs = Date.now();
   const body = await readJsonBody(request);
   if (!body.targetDeviceId) {
     json(response, 400, { error: "targetDeviceId is required." });
@@ -1327,16 +1502,18 @@ async function handlePairRequest(request, response) {
     targetName: target.deviceName,
   });
 
-  let hostedStatus = null;
-  let inviteSession = state.hostedSession;
+  const hostReadyStartedAtMs = Date.now();
+  const { hostedStatus } = await ensureHostedSession();
+  const inviteSession = state.hostedSession;
 
-  if (!inviteSession) {
-    inviteSession = createHostedSession();
-  } else {
-    hostedStatus = await readHostedStatus(inviteSession.statusFile);
-  }
+  pushDiagnostic("pair.host.ready", {
+    sessionId: inviteSession?.sessionId || null,
+    ssid: inviteSession?.ssid || null,
+    durationMs: elapsedMs(hostReadyStartedAtMs),
+  });
 
   const requestId = crypto.randomUUID();
+  const dispatchStartedAtMs = Date.now();
   const upstream = await fetch(`http://${target.ip}:${target.port}/api/pair/incoming`, {
     method: "POST",
     headers: {
@@ -1365,6 +1542,7 @@ async function handlePairRequest(request, response) {
       targetIp: target.ip,
       targetPort: target.port,
       message,
+      durationMs: elapsedMs(pairStartedAtMs),
     });
     throw new Error(message);
   }
@@ -1379,6 +1557,8 @@ async function handlePairRequest(request, response) {
     ssid: inviteSession.ssid,
     targetDeviceId: body.targetDeviceId,
     targetName: target.deviceName,
+    dispatchDurationMs: elapsedMs(dispatchStartedAtMs),
+    durationMs: elapsedMs(pairStartedAtMs),
   });
 
   json(response, 200, serialiseState(hostedStatus));
@@ -1550,6 +1730,7 @@ async function handleTransferPrepare(request, response) {
     senderName: body.senderName || "Unknown device",
     size,
     lastModified: Number(body.lastModified || 0) || 0,
+    fileHash: body.fileHash || null,
     chunkSize,
     totalChunks,
   });
@@ -1566,6 +1747,16 @@ async function handleTransferComplete(request, response) {
 
   const completion = await completeIncomingChunkTransfer(body.fileId, body.transferId);
   if (!completion.ok) {
+    if (completion.hashVerified === false || completion.code === "HASH_MISMATCH") {
+      json(response, 422, {
+        error: completion.error || "Received file failed integrity verification.",
+        code: completion.code || "HASH_MISMATCH",
+        retryable: completion.retryable === true,
+        hashVerified: false,
+      });
+      return;
+    }
+
     json(response, 409, {
       error: "The receiver is still missing chunks for this transfer.",
       pendingChunks: completion.pendingChunks,

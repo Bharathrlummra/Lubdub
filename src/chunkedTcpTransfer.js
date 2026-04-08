@@ -3,7 +3,7 @@ const net = require("node:net");
 
 const TRANSFER_PORT_OFFSET = Number(process.env.TRANSFER_PORT_OFFSET || 10);
 const DEFAULT_CHUNK_SIZE = Number(process.env.TRANSFER_CHUNK_SIZE || 1024 * 1024);
-const DEFAULT_TRANSFER_LANES = Number(process.env.TRANSFER_LANES || 2);
+const DEFAULT_TRANSFER_LANES = Number(process.env.TRANSFER_LANES || 4);
 
 function getTransferPort(basePort) {
   return basePort + TRANSFER_PORT_OFFSET;
@@ -44,14 +44,75 @@ function splitChunksAcrossLanes(chunkIndexes, laneCount) {
 
 function writeSocket(socket, buffer) {
   return new Promise((resolve, reject) => {
-    socket.write(buffer, (error) => {
-      if (error) {
-        reject(error);
+    const cleanup = () => {
+      socket.off("drain", handleDrain);
+      socket.off("error", handleError);
+    };
+
+    const handleDrain = () => {
+      cleanup();
+      resolve();
+    };
+
+    const handleError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    socket.once("error", handleError);
+
+    try {
+      const canContinue = socket.write(buffer);
+      if (canContinue) {
+        cleanup();
+        resolve();
         return;
       }
 
+      socket.once("drain", handleDrain);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
+  });
+}
+
+function writeChunk(socket, headerFrame, body) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      socket.off("drain", handleDrain);
+      socket.off("error", handleError);
+    };
+
+    const handleDrain = () => {
+      cleanup();
       resolve();
-    });
+    };
+
+    const handleError = (error) => {
+      cleanup();
+      reject(error);
+    };
+
+    socket.once("error", handleError);
+
+    try {
+      socket.cork();
+      const headerOk = socket.write(headerFrame);
+      const bodyOk = socket.write(body);
+      socket.uncork();
+
+      if (headerOk && bodyOk) {
+        cleanup();
+        resolve();
+        return;
+      }
+
+      socket.once("drain", handleDrain);
+    } catch (error) {
+      cleanup();
+      reject(error);
+    }
   });
 }
 
@@ -62,6 +123,9 @@ function createChunkedTransferServer({
   onDiagnostic = () => {},
 }) {
   const server = net.createServer((socket) => {
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 10000);
+
     let buffer = Buffer.alloc(0);
     let currentHeader = null;
     let processing = false;
@@ -172,7 +236,10 @@ async function sendChunkedTransfer({
   const lanes = splitChunksAcrossLanes(pendingChunks, laneCount);
 
   async function sendLane(chunkIndexes, laneId) {
+    const laneStartedAtMs = Date.now();
     const socket = net.createConnection({ host, port });
+    socket.setNoDelay(true);
+    socket.setKeepAlive(true, 10000);
 
     await new Promise((resolve, reject) => {
       socket.once("connect", resolve);
@@ -208,7 +275,7 @@ async function sendChunkedTransfer({
           );
         }
 
-        await writeSocket(
+        await writeChunk(
           socket,
           encodeJsonFrame({
             type: "CHUNK",
@@ -219,8 +286,8 @@ async function sendChunkedTransfer({
             offset,
             length,
           }),
+          body,
         );
-        await writeSocket(socket, body);
         bytesSent += length;
         onChunkSent({ chunkIndex, length, laneId });
       }
@@ -245,6 +312,7 @@ async function sendChunkedTransfer({
         laneId,
         chunkCount: chunkIndexes.length,
         bytesSent,
+        durationMs: Math.max(0, Date.now() - laneStartedAtMs),
       });
     } catch (error) {
       socket.destroy(error);
@@ -254,11 +322,13 @@ async function sendChunkedTransfer({
         laneId,
         chunkCount: chunkIndexes.length,
         message: error.message,
+        durationMs: Math.max(0, Date.now() - laneStartedAtMs),
       });
       throw error;
     }
   }
 
+  const sendStartedAtMs = Date.now();
   try {
     await Promise.all(lanes.map((chunkIndexes, index) => sendLane(chunkIndexes, index + 1)));
   } finally {
@@ -270,6 +340,7 @@ async function sendChunkedTransfer({
     fileId: manifest.fileId,
     laneCount: lanes.length,
     chunkCount: pendingChunks.length,
+    durationMs: Math.max(0, Date.now() - sendStartedAtMs),
   });
 }
 
