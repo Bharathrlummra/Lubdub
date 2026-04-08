@@ -112,19 +112,6 @@ function createChunkedTransferServer({
           socket.resume();
         }
       }
-
-      if (buffer.length > 0 && !processing) {
-        queueMicrotask(() => {
-          processBuffer().catch((error) => {
-            onDiagnostic("transfer.chunk.socket.error", {
-              message: error.message,
-              remoteAddress: socket.remoteAddress,
-              remotePort: socket.remotePort,
-            });
-            socket.destroy(error);
-          });
-        });
-      }
     }
 
     socket.on("data", (chunk) => {
