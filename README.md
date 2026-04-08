@@ -1,288 +1,534 @@
 # LUBDUB Share
 
-LUBDUB Share is a Windows-to-Windows offline file sharing prototype. It is designed to work like a lightweight SHAREit-style flow:
+LUBDUB Share is a Windows-to-Windows local file sharing prototype inspired by the SHAREit-style flow:
 
-- discover another nearby PC
-- send a connection request
-- approve the request on the receiver
-- connect over a temporary Wi-Fi Direct session
-- send files directly
+1. discover another nearby PC
+2. send a connection request
+3. approve the request on the receiver
+4. create or join a temporary Wi-Fi Direct session
+5. transfer files directly between the two PCs
 
-This project is currently a local web app that runs on each PC.
+This README is written as a study guide for the current implementation so you can understand the exact flow we are using now.
 
-## User Guide
+## What LUBDUB Is Doing Right Now
 
-### What LUBDUB does
+The current product has three major stages:
 
-- Sends a connection request from one PC to another
-- Lets the receiver approve the request with `Approve & Connect`
-- Creates a temporary Wi-Fi Direct session between the two PCs
-- Transfers files directly without internet using a dedicated chunked TCP data socket
-- Saves incoming files in the `Received` folder
-- Shows debug and diagnostic details when a connection fails
+1. `Discovery and approval`
+2. `Wi-Fi Direct connection and registration`
+3. `Chunked TCP file transfer`
 
-### Requirements
+It is currently implemented as a local web app on each PC:
 
-- Windows on both PCs
-- Node.js installed on both PCs
-- Both PCs should be near each other
-- For the `Nearby Devices` flow, both PCs should first be on the same existing Wi-Fi or LAN
-- Windows Firewall should allow `node.exe` if connection or discovery fails
+- `Node.js` app server on each machine
+- browser UI at `http://localhost:48621`
+- PowerShell scripts for Wi-Fi Direct host/join actions
+- UDP discovery for fast host detection after join
+- TCP chunk transfer for the peer-to-peer file hop
 
-### Start the app
+## Current Flow At A Glance
 
-Run this on both PCs:
+### Normal user flow
 
-```powershell
-npm start
-```
+On the sender:
 
-Then open:
+1. open LUBDUB
+2. wait for the other PC in `Nearby Devices`
+3. click `Send Connect Request`
+4. after connection, choose a file and click `Send`
 
-```text
-http://localhost:48621
-```
+On the receiver:
 
-If the browser does not open automatically, paste the address manually.
+1. open LUBDUB
+2. wait for the request in `Connection Requests`
+3. click `Approve & Connect`
+4. wait for Wi-Fi Direct join and registration
+5. receive the file in `Received`
 
-## Main Sharing Flow
+### Current internal flow
 
-This is the preferred flow.
+1. both PCs advertise themselves on the current LAN
+2. sender starts or reuses a Wi-Fi Direct host
+3. sender sends a pair request to the receiver over the current LAN
+4. receiver approves
+5. receiver joins the sender's Wi-Fi Direct SSID
+6. receiver uses UDP to discover the host service quickly on the Wi-Fi Direct subnet
+7. receiver registers with the host over HTTP
+8. sender caches the browser upload to a local temp file
+9. sender asks the receiver which chunks are missing
+10. sender opens 2 TCP lanes and sends the pending chunks
+11. receiver writes chunks by offset into a partial file
+12. receiver finalizes the file after all chunks are received
 
-### On the sender PC
+## Modules And Responsibilities
 
-1. Open LUBDUB.
-2. Wait for the other PC to appear in `Nearby Devices`.
-3. Click `Send Connect Request` on the target device.
+### Core files
 
-### On the receiver PC
+- `src/server.js`
+  Main application server. Handles HTTP APIs, session state, pair requests, host registration, transfer prepare/complete calls, diagnostics, and startup.
 
-1. Open LUBDUB.
-2. Wait for the request to appear in `Connection Requests`.
-3. Click `Approve & Connect`.
-4. Wait while LUBDUB joins the Wi-Fi Direct session automatically.
+- `src/wifiDirectManager.js`
+  Starts and stops the Wi-Fi Direct host and reads host status produced by the PowerShell scripts.
 
-### After connection
+- `src/wifiDirectDiscovery.js`
+  Handles UDP `DISCOVER_HOST` and `HOST_READY` style behavior after the receiver joins Wi-Fi Direct.
 
-1. Go to `Send File`.
-2. Choose the target device.
-3. Pick a file.
-4. Click `Send`.
+- `src/networkDiscovery.js`
+  Fallback scan-based discovery if UDP discovery does not succeed.
 
-Incoming files are saved in:
+- `src/nearbyDiscovery.js`
+  LAN discovery before Wi-Fi Direct connection starts.
 
-```text
-Received
-```
+- `src/chunkedTcpTransfer.js`
+  Current chunked multi-lane TCP data plane.
 
-## Fallback Manual Join Flow
+- `public/app.js`
+  Browser-side UI logic. Sends pair actions and file uploads to the local Node app.
 
-Use this if `Nearby Devices` does not show the other PC.
+- `scripts/start-wifi-direct-host.ps1`
+  Starts the Wi-Fi Direct host on Windows.
 
-### On the sender PC
+- `scripts/join-wifi-direct.ps1`
+  Joins the Wi-Fi Direct session on Windows.
 
-1. Click `Start Session`.
-2. Copy the `Invite Code`.
+## Detailed Flow
 
-### On the receiver PC
+### 1. App startup
 
-1. Paste the code into `Join Session`.
-2. Click `Join Session`.
+When `npm start` runs:
 
-After the receiver joins, both sides can send files.
+- `src/server.js` creates the local HTTP server on port `48621`
+- starts the chunked transfer TCP server on port `48631`
+- starts UDP Wi-Fi discovery on port `48623`
+- starts LAN discovery advertisements
 
-## What You See in the UI
+Typical logs:
 
-### This Device
+- `app.start`
+- `transfer.chunk.listen`
+- `wifi-discovery.listen`
 
-Shows:
+### 2. Nearby discovery before pairing
 
-- device name
-- device ID
-- current role: `idle`, `host`, or `client`
+Before Wi-Fi Direct starts, both PCs must usually be reachable on the same existing Wi-Fi or LAN.
 
-### Host Session
+LUBDUB uses:
 
-Shows:
+- `src/nearbyDiscovery.js`
+- local advertisement and discovery on the current network
 
-- Wi-Fi Direct SSID
-- passphrase
-- invite code
-- host start status
+This populates the `Nearby Devices` list in the UI.
 
-### Join Session
+Important detail:
 
-Lets a receiver join using the invite code manually.
+- this stage is only for finding the other device and sending the pair request
+- it is not the final transfer path
 
-### Nearby Devices
+### 3. Sender sends a connection request
 
-Shows devices discovered on the same local network before Wi-Fi Direct connection starts.
+When the sender clicks `Send Connect Request`:
 
-### Connection Requests
+1. `public/app.js` calls `POST /api/pair/request`
+2. `src/server.js` checks the selected nearby device
+3. if needed, the sender starts a Wi-Fi Direct host
+4. the sender creates an invite payload:
+   - `sessionId`
+   - `ssid`
+   - `passphrase`
+   - `port`
+   - `hostName`
+5. the sender posts this request to the receiver over the current LAN
 
-Shows incoming requests that can be:
+Important logs:
 
-- approved
-- declined
+- `pair.request.send`
+- `host.starting`
+- `host.started`
+- `pair.request.sent`
 
-### Send File
+### 4. Receiver approves and auto-connects
 
-Lets you choose a connected target and send a file.
+When the receiver clicks `Approve & Connect`:
 
-### Connected Peers
+1. `public/app.js` calls `POST /api/pair/approve`
+2. `src/server.js` marks the request as approved
+3. the background connect flow starts
+4. receiver decodes the invite
+5. receiver runs the Wi-Fi Direct join script
 
-Shows connected devices after pairing succeeds.
+Important logs:
 
-### Received Files
+- `pair.request.approved`
+- `pair.connect.start`
+- `join.start`
+- `join.network.connected`
 
-Shows recently received files and where they were saved.
+At this point, the receiver should be on the `LUBDUB-...` SSID.
 
-### Diagnostics
+### 5. Receiver discovers the host after Wi-Fi Direct join
 
-Shows the latest debug events for this device.
+After joining the Wi-Fi Direct network, the receiver must find the sender's app service.
 
-This is useful when:
+Current primary path:
 
-- the request appears but connection fails
-- the request does not appear
-- Wi-Fi Direct joins but host registration fails
+- receiver broadcasts UDP discovery using `src/wifiDirectDiscovery.js`
+- sender replies with host IP and port
+- receiver uses that reply as the host address
 
-## Debugging and Logs
+Fallback path:
 
-LUBDUB now writes debug output in three places:
+- `src/networkDiscovery.js` scan-based host search
 
-### 1. Terminal
+Important logs:
 
-When you run `npm start`, you will see lines like:
+- receiver: `wifi-discovery.discover.send`
+- sender: `wifi-discovery.request`
+- sender: `wifi-discovery.reply`
+- receiver: `wifi-discovery.match`
+- receiver: `join.discovery.success`
 
-```text
-[LUBDUB DEBUG] 2026-04-07T00:00:00.000Z pair.request.approved {...}
-```
+### 6. Receiver registers with the sender
 
-### 2. In-app Diagnostics panel
+After the receiver learns the sender IP:
 
-The app shows the latest connection events directly in the UI.
+1. receiver calls `POST /api/session/register`
+2. sender stores the peer in memory
+3. sender returns `transferPort`
 
-### 3. Log file
+This step makes the two devices visible in the app as connected peers.
 
-Logs are also saved here:
+Important logs:
 
-```text
-runtime/lubdub-debug.log
-```
+- `register.start`
+- `register.success`
+- `peer.registered`
+- `join.complete`
+- `pair.connect.success`
 
-## Important Debug Events
+### 7. Current file transfer flow
 
-These log names help identify the failure point:
+This is the most important section for performance study.
 
-- `pair.request.send`: sender started sending a request
-- `pair.request.received`: receiver got the request
-- `pair.request.approved`: receiver approved the request
-- `pair.connect.start`: receiver started the connection flow
-- `host.starting`: sender started creating the Wi-Fi Direct host
-- `host.started`: sender host session became active
-- `join.start`: receiver began joining the Wi-Fi Direct session
-- `join.network.connected`: receiver joined the Wi-Fi Direct network
-- `join.network.error`: Windows failed while joining the Wi-Fi Direct network
-- `discover.scan`: receiver scanned for the sender host service
-- `discover.match`: receiver found the sender host IP
-- `discover.timeout`: receiver could not find the sender host service in time
-- `wifi-discovery.discover.send`: receiver broadcast a UDP host discovery request
-- `wifi-discovery.request`: sender received the UDP discovery request
-- `wifi-discovery.reply`: sender replied with host readiness
-- `wifi-discovery.match`: receiver matched a UDP host-ready reply
-- `wifi-discovery.timeout`: receiver did not receive a UDP host reply in time
-- `register.start`: receiver tried to register with the sender
-- `register.success`: receiver successfully registered with the sender
-- `register.error`: registration reached the sender but failed
-- `pair.connect.error`: connect flow failed after approval
-- `transfer.chunk.listen`: chunked TCP transfer server is listening
-- `transfer.chunk.cache.start`: sender started caching the browser upload locally
-- `transfer.chunk.cache.complete`: sender finished caching the file and is ready to send chunks
-- `transfer.chunk.prepare`: receiver prepared a resumable incoming transfer session
-- `transfer.chunk.resume`: sender received the list of missing chunks from the receiver
-- `transfer.chunk.lane.start`: one TCP lane started sending its assigned chunks
-- `transfer.chunk.lane.complete`: one TCP lane finished sending its assigned chunks
-- `transfer.chunk.lane.received`: receiver flushed progress for one completed lane
-- `transfer.chunk.send.complete`: sender finished sending all requested chunks
-- `transfer.chunk.receive.complete`: receiver finalized the file after all chunks were present
+When the sender chooses a file in the browser and clicks `Send`:
 
-## Troubleshooting
+### Step A: browser uploads the file to the local Node app
 
-### The other PC does not appear in Nearby Devices
+`public/app.js` sends:
 
-Check the following:
+- `POST /api/files/send`
+- headers:
+  - `x-file-name`
+  - `x-file-size`
+  - `x-file-last-modified`
 
-- both PCs are running LUBDUB
-- both PCs are on the same Wi-Fi or LAN before pairing
-- both PCs opened `http://localhost:48621`
-- firewall is not blocking `node.exe`
+This request goes from:
 
-If it still does not appear, use the fallback invite-code method.
+- browser -> local Node app
 
-### I can send a request, but approval does not connect
+This is not yet the peer-to-peer send.
 
-Check `Diagnostics` or `runtime/lubdub-debug.log`.
+### Step B: sender caches the upload to disk first
 
-Most common causes:
+In `src/server.js`, the sender currently writes the full upload to:
 
+- `runtime/transfers/outgoing/...`
+
+Important logs:
+
+- `transfer.chunk.cache.start`
+- `transfer.chunk.cache.complete`
+
+This is a key current bottleneck.
+
+Right now the sender does:
+
+1. receive full upload from browser
+2. save full temp file locally
+3. only then start peer-to-peer chunk sending
+
+This adds extra end-to-end delay, especially for `119 MB` and `323 MB` files.
+
+### Step C: sender asks receiver which chunks are missing
+
+After caching is complete:
+
+1. sender calls `POST /api/transfers/prepare`
+2. receiver creates or reuses an incoming transfer session
+3. receiver calculates which chunks are still missing
+4. receiver returns:
+   - `fileId`
+   - `chunkSize`
+   - `totalChunks`
+   - `pendingChunks`
+   - `transferPort`
+
+Important logs:
+
+- sender: `transfer.chunk.resume`
+- receiver: `transfer.chunk.prepare`
+
+### Step D: sender opens TCP data lanes and sends chunks
+
+The actual peer-to-peer file hop is handled by `src/chunkedTcpTransfer.js`.
+
+Current behavior:
+
+- chunk size is `1 MiB`
+- lane count is `2` by default
+- sender splits pending chunks across 2 lanes
+- each lane opens its own TCP socket to port `48631`
+- sender sends:
+  - a JSON chunk header
+  - the chunk bytes
+- after all chunks for that lane are sent, that lane sends `LANE_COMPLETE`
+
+Important logs:
+
+- `transfer.chunk.lane.start`
+- `transfer.chunk.lane.complete`
+- `transfer.chunk.send.complete`
+
+### Step E: receiver writes chunks by offset
+
+On the receiver:
+
+- `src/server.js` keeps an incoming transfer session in memory
+- receiver writes each chunk into a `.part` file at the correct offset
+- receiver tracks completed chunk indexes
+- receiver periodically persists resume state under:
+  - `runtime/transfers/incoming/...`
+
+Important logs:
+
+- `transfer.chunk.lane.received`
+
+### Step F: receiver finalizes the file
+
+After sender finishes the data lanes:
+
+1. sender calls `POST /api/transfers/complete`
+2. receiver checks whether all chunks are present
+3. if complete, receiver renames the partial file into `Received/...`
+4. receiver records the transfer in `receivedFiles`
+
+Important logs:
+
+- receiver: `transfer.chunk.receive.complete`
+
+## Why The Current Chunked Flow Is Not Yet Faster For Every File
+
+The current design improved reliability and created the base for resume, but it does not always improve user-visible speed.
+
+Why:
+
+1. `Full cache before send`
+   The sender waits for the whole browser upload to finish before peer send starts.
+
+2. `Extra disk I/O`
+   We now write:
+   - browser -> sender temp file
+   - sender temp file -> receiver temp file
+   - receiver temp file -> final file
+
+3. `Chunk orchestration overhead`
+   We added:
+   - prepare call
+   - chunk tracking
+   - lane coordination
+   - finalize call
+
+4. `Resume safety costs`
+   The receiver persists incoming state so retries can resume later.
+
+So the current chunked system is best understood as:
+
+- `better reliability foundation`
+- `better resume foundation`
+- `not yet the fastest end-to-end path`
+
+## Current Performance Reality
+
+Based on recent tests, the current behavior is:
+
+- small and medium files are often not faster than the older single-stream raw TCP path
+- large files are more stable
+- the biggest visible loss comes from the sender-side cache phase
+
+That means the next speed improvement must come from:
+
+1. `pipelined send while caching`
+2. `adaptive transfer modes`
+3. `better lane scheduling`
+4. `lighter resume persistence`
+
+## Current Diagnostic Events
+
+### Pairing and connection events
+
+- `pair.request.send`
+- `pair.request.received`
+- `pair.request.approved`
+- `pair.connect.start`
+- `host.starting`
+- `host.started`
+- `join.start`
+- `join.network.connected`
 - `join.network.error`
-  Windows did not connect to the Wi-Fi Direct SSID.
-
+- `wifi-discovery.discover.send`
+- `wifi-discovery.request`
+- `wifi-discovery.reply`
+- `wifi-discovery.match`
+- `wifi-discovery.timeout`
+- `discover.scan`
+- `discover.match`
 - `discover.timeout`
-  The receiver joined Wi-Fi Direct, but could not reach the sender host service.
-
+- `register.start`
+- `register.success`
 - `register.error`
-  The receiver found the sender, but registration was rejected or blocked.
+- `peer.registered`
+- `join.complete`
+- `pair.connect.success`
+- `pair.connect.error`
 
-### Files do not transfer
+### Transfer events
 
-Check:
+- `transfer.chunk.listen`
+- `transfer.chunk.cache.start`
+- `transfer.chunk.cache.complete`
+- `transfer.chunk.prepare`
+- `transfer.chunk.resume`
+- `transfer.chunk.lane.start`
+- `transfer.chunk.lane.complete`
+- `transfer.chunk.lane.error`
+- `transfer.chunk.lane.received`
+- `transfer.chunk.send.complete`
+- `transfer.chunk.receive.complete`
+- `transfer.chunk.protocol.error`
+- `transfer.chunk.socket.error`
 
-- the devices are listed in `Connected Peers`
-- the receiver actually completed registration
-- Windows Firewall allows `node.exe`
+## Where Files And State Are Stored
 
-### Where are received files saved
+### Final received files
 
-They are saved in:
+- `Received/`
 
-```text
-Received
-```
+### Sender-side temporary upload cache
 
-## Project Structure
+- `runtime/transfers/outgoing/`
 
-- `src/server.js`: app server, session handling, request approval, transfer routes, diagnostics
-- `src/chunkedTcpTransfer.js`: chunked multi-lane TCP transfer engine used for peer-to-peer file transfer
-- `src/wifiDirectManager.js`: Wi-Fi Direct start and stop logic
-- `src/wifiDirectDiscovery.js`: UDP host discovery after the receiver joins Wi-Fi Direct
-- `src/networkDiscovery.js`: fallback HTTP scan-based host discovery
-- `src/nearbyDiscovery.js`: local-network discovery before Wi-Fi Direct connection starts
-- `scripts/start-wifi-direct-host.ps1`: starts the Wi-Fi Direct host session
-- `scripts/join-wifi-direct.ps1`: joins a Wi-Fi Direct session from invite data
-- `public/index.html`: UI layout
-- `public/app.js`: UI behavior
-- `public/styles.css`: UI styling
+### Receiver-side partial files and resume state
+
+- `runtime/transfers/incoming/`
+
+### Debug log
+
+- `runtime/lubdub-debug.log`
+
+## Current API Flow
+
+These are the main APIs in the current implementation:
+
+### Pairing and session APIs
+
+- `POST /api/pair/request`
+- `POST /api/pair/incoming`
+- `POST /api/pair/approve`
+- `POST /api/pair/reject`
+- `POST /api/session/join`
+- `POST /api/session/register`
+- `GET /api/host/probe`
+
+### Transfer APIs
+
+- `POST /api/files/send`
+  browser upload enters the sender app here
+
+- `POST /api/transfers/prepare`
+  sender asks receiver which chunks are missing
+
+- `POST /api/transfers/complete`
+  sender asks receiver to finalize the file
+
+## Example End-To-End Sequence
+
+Here is the current real sequence for a successful transfer:
+
+1. both PCs start `npm start`
+2. both PCs appear in `Nearby Devices`
+3. sender clicks `Send Connect Request`
+4. sender starts Wi-Fi Direct host
+5. sender sends pair request to receiver
+6. receiver clicks `Approve & Connect`
+7. receiver joins `LUBDUB-...` SSID
+8. receiver broadcasts UDP discovery
+9. sender replies with host readiness
+10. receiver registers with sender
+11. sender chooses a file
+12. browser uploads full file to sender app
+13. sender writes full temp file locally
+14. sender asks receiver for missing chunks
+15. receiver returns all chunk indexes as pending
+16. sender opens 2 TCP lanes and sends chunk data
+17. receiver writes chunks into a partial file
+18. sender calls transfer complete
+19. receiver renames the file into `Received`
+20. UI shows the transfer as finished
 
 ## Current Limitations
 
-- This is still an MVP
-- It is a local web UI, not a packaged desktop app yet
-- Wi-Fi Direct behavior can vary by adapter and Windows version
-- The nearby-device flow depends on the PCs first seeing each other on the same local network
-- Final hardening should be tested on two physical Windows PCs
+- still a local web UI, not a packaged desktop app
+- Wi-Fi Direct behavior depends on Windows and adapter support
+- the `Nearby Devices` flow still depends on the PCs first seeing each other on an existing LAN
+- sender currently waits for full browser upload caching before peer send starts
+- chunked transfer is better for reliability, but not yet consistently faster for all file sizes
+- there is no final file hash verification yet
+- there is no transfer encryption layer yet
 
-## Suggested Test Flow
+## What Should Improve Next
 
-1. Start `npm start` on both PCs.
-2. Open `http://localhost:48621` on both PCs.
-3. Use `Nearby Devices` and send a request.
-4. Approve on the receiver.
-5. If connection fails, open `Diagnostics`.
-6. Check terminal logs for the last debug events.
-7. If needed, open `runtime/lubdub-debug.log`.
+If the goal is higher throughput and lower end-to-end latency, the next changes should be:
+
+1. stream `cache + send` in parallel instead of waiting for full cache completion
+2. use adaptive transfer modes:
+   - smaller files: direct fast path
+   - larger files: chunked/resumable path
+3. reduce resume-state write overhead
+4. improve lane scheduling
+5. add integrity verification
+
+## How To Study The Flow In Practice
+
+The easiest way to study the real runtime flow is:
+
+1. start `npm start` on both PCs
+2. open `http://localhost:48621` on both PCs
+3. send a connection request
+4. approve on the receiver
+5. transfer one file
+6. read the terminal logs in order
+
+The logs will show the exact movement through:
+
+- discovery
+- approval
+- join
+- UDP host discovery
+- registration
+- cache
+- chunk prepare
+- TCP lane transfer
+- final receive complete
 
 ## Status
 
-This project is working as a prototype and now includes detailed debug logging to help trace connection failures step by step.
+LUBDUB is currently a working prototype with:
+
+- SHAREit-style request and approval flow
+- automatic Wi-Fi Direct join
+- UDP host discovery after join
+- peer registration
+- chunked TCP transfer
+- receiver-side resumable transfer state
+- diagnostics in terminal, UI, and log file
+
+It is already usable for two-PC testing, and the next work is focused on making the current transfer path faster end-to-end.
