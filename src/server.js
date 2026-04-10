@@ -767,7 +767,6 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
   }
 
   await closeIncomingTransferSession(session);
-  state.incomingTransfers.delete(fileId);
 
   let hashVerified = null;
   if (session.fileHash) {
@@ -811,6 +810,7 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
   }
 
   if (hashVerified === false) {
+    state.incomingTransfers.delete(fileId);
     await fsp.rm(session.partialPath, { force: true }).catch(() => {});
     await fsp.rm(session.statePath, { force: true }).catch(() => {});
 
@@ -832,8 +832,13 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
     };
   }
 
+  // Ensure the Received directory exists before renaming.
+  await fsp.mkdir(path.dirname(session.savedPath), { recursive: true });
   await fsp.rename(session.partialPath, session.savedPath);
   await fsp.rm(session.statePath, { force: true });
+  // Only delete the session from the map AFTER the rename succeeds.
+  // Previously this was done before the rename, causing ENOENT on retry.
+  state.incomingTransfers.delete(fileId);
 
   state.receivedFiles.unshift({
     id: transferId,
