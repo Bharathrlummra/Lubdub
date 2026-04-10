@@ -371,22 +371,33 @@ async function sendChunkedTransfer({
     let bytesSent = 0;
 
     try {
-      for (const chunkIndex of chunkIndexes) {
-        const offset = chunkIndex * manifest.chunkSize;
-        const length = Math.min(manifest.chunkSize, manifest.size - offset);
-        const body = Buffer.allocUnsafe(length);
+      // Double buffering: read the next chunk from disk while sending
+      // the current one.  This overlaps disk I/O with network I/O.
+      async function readChunk(idx) {
+        const off = idx * manifest.chunkSize;
+        const len = Math.min(manifest.chunkSize, manifest.size - off);
+        const buf = Buffer.allocUnsafe(len);
         const { bytesRead } = await fileHandle.read({
-          buffer: body,
+          buffer: buf,
           offset: 0,
-          length,
-          position: offset,
+          length: len,
+          position: off,
         });
-
-        if (bytesRead !== length) {
+        if (bytesRead !== len) {
           throw new Error(
-            `Expected to read ${length} bytes for chunk ${chunkIndex}, but got ${bytesRead}.`,
+            `Expected to read ${len} bytes for chunk ${idx}, but got ${bytesRead}.`,
           );
         }
+        return { buf, off, len, idx };
+      }
+
+      // Pre-read the first chunk
+      let current = await readChunk(chunkIndexes[0]);
+
+      for (let i = 0; i < chunkIndexes.length; i++) {
+        // Start reading the NEXT chunk while we send the current one
+        const nextPromise =
+          i + 1 < chunkIndexes.length ? readChunk(chunkIndexes[i + 1]) : null;
 
         await writeChunk(
           socket,
@@ -395,14 +406,18 @@ async function sendChunkedTransfer({
             transferId: manifest.transferId,
             fileId: manifest.fileId,
             laneId,
-            chunkIndex,
-            offset,
-            length,
+            chunkIndex: current.idx,
+            offset: current.off,
+            length: current.len,
           }),
-          body,
+          current.buf,
         );
-        bytesSent += length;
-        onChunkSent({ chunkIndex, length, laneId });
+        bytesSent += current.len;
+        onChunkSent({ chunkIndex: current.idx, length: current.len, laneId });
+
+        if (nextPromise) {
+          current = await nextPromise;
+        }
       }
 
       socket.end(

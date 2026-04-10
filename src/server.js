@@ -560,6 +560,13 @@ async function createIncomingTransferSession(manifest) {
     laneWriteQueues: new Map(),
     laneFileHandles: new Map(),
     closed: false,
+    // Incremental hash: compute SHA-256 as chunks arrive instead of
+    // re-reading the entire file after transfer.  Chunks from parallel
+    // lanes may arrive out of order, so we buffer out-of-order chunks
+    // and hash them sequentially when their turn comes.
+    incrementalHash: crypto.createHash("sha256"),
+    nextHashIndex: 0,
+    hashPendingChunks: new Map(),
   };
 
   await persistIncomingTransferState(session);
@@ -694,6 +701,25 @@ async function recordIncomingChunk(chunkHeader, body) {
       session.completedChunks.add(chunkHeader.chunkIndex);
       session.dirtyChunkCount += 1;
 
+      // ── Incremental hash: feed chunks to SHA-256 in order ─────────
+      // If this is the next expected chunk, hash it immediately and
+      // then flush any buffered out-of-order chunks that follow it.
+      if (session.incrementalHash) {
+        if (chunkHeader.chunkIndex === session.nextHashIndex) {
+          session.incrementalHash.update(body);
+          session.nextHashIndex++;
+          // Flush sequential run of buffered chunks
+          while (session.hashPendingChunks.has(session.nextHashIndex)) {
+            session.incrementalHash.update(session.hashPendingChunks.get(session.nextHashIndex));
+            session.hashPendingChunks.delete(session.nextHashIndex);
+            session.nextHashIndex++;
+          }
+        } else if (chunkHeader.chunkIndex > session.nextHashIndex) {
+          // Out of order — buffer a copy for later
+          session.hashPendingChunks.set(chunkHeader.chunkIndex, Buffer.from(body));
+        }
+      }
+
       // Batch-persist every STATE_FLUSH_INTERVAL chunks for resume support.
       // Without this, state was only saved on lane-complete, meaning a
       // crash mid-transfer could lose up to (totalChunks / laneCount) of
@@ -746,7 +772,24 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
   let hashVerified = null;
   if (session.fileHash) {
     try {
-      const receivedHash = await computeFileHash(session.partialPath);
+      let receivedHash;
+
+      // Use the incremental hash if all chunks were hashed in order.
+      // This avoids re-reading the entire file from disk — for a 1 GB
+      // file this saves ~3-5 seconds.
+      if (
+        session.incrementalHash &&
+        session.nextHashIndex === session.totalChunks &&
+        session.hashPendingChunks.size === 0
+      ) {
+        receivedHash = session.incrementalHash.digest("hex");
+        session.incrementalHash = null;
+      } else {
+        // Fallback: full-file hash (e.g. resumed transfers where we
+        // didn't have the incremental state for earlier chunks).
+        receivedHash = await computeFileHash(session.partialPath);
+      }
+
       hashVerified = receivedHash === session.fileHash;
       pushDiagnostic("transfer.chunk.hash.verify", {
         transferId,
@@ -755,6 +798,7 @@ async function completeIncomingChunkTransfer(fileId, transferId) {
         expectedHash: session.fileHash.slice(0, 16) + "...",
         receivedHash: receivedHash.slice(0, 16) + "...",
         verified: hashVerified,
+        method: session.nextHashIndex === session.totalChunks ? "incremental" : "full-file",
       });
     } catch (error) {
       pushDiagnostic("transfer.chunk.hash.error", {
