@@ -43,6 +43,7 @@ const MAX_JSON_BYTES = 256 * 1024;
 const NEARBY_DEVICE_STALE_MS = 12000;
 const MAX_DIAGNOSTIC_ENTRIES = 40;
 const MAX_TRANSFER_RETRIES = 3;
+const STATE_FLUSH_INTERVAL = 25;
 
 const state = {
   deviceId: "",
@@ -692,6 +693,14 @@ async function recordIncomingChunk(chunkHeader, body) {
 
       session.completedChunks.add(chunkHeader.chunkIndex);
       session.dirtyChunkCount += 1;
+
+      // Batch-persist every STATE_FLUSH_INTERVAL chunks for resume support.
+      // Without this, state was only saved on lane-complete, meaning a
+      // crash mid-transfer could lose up to (totalChunks / laneCount) of
+      // progress.  Fire-and-forget to avoid blocking the write pipeline.
+      if (session.dirtyChunkCount >= STATE_FLUSH_INTERVAL) {
+        persistIncomingTransferState(session).catch(() => {});
+      }
     }
   });
 }
@@ -938,23 +947,23 @@ async function completePeerTransfer(target, transferId, fileId) {
 }
 
 function getAdaptiveChunkSize(fileSize) {
-  if (fileSize < 10 * 1024 * 1024) return 256 * 1024;
-  if (fileSize < 100 * 1024 * 1024) return Math.max(DEFAULT_CHUNK_SIZE, 1024 * 1024);
-  if (fileSize < 750 * 1024 * 1024) return 4 * 1024 * 1024;
-  if (fileSize < 2 * 1024 * 1024 * 1024) return 8 * 1024 * 1024;
-  return 16 * 1024 * 1024;
+  if (fileSize < 10 * 1024 * 1024) return 512 * 1024;
+  if (fileSize < 100 * 1024 * 1024) return Math.max(DEFAULT_CHUNK_SIZE, 2 * 1024 * 1024);
+  if (fileSize < 500 * 1024 * 1024) return 8 * 1024 * 1024;
+  if (fileSize < 2 * 1024 * 1024 * 1024) return 16 * 1024 * 1024;
+  return 32 * 1024 * 1024;
 }
 
 function getAdaptiveLaneCount(fileSize, pendingChunkCount) {
-  if (fileSize < 100 * 1024 * 1024) {
+  if (fileSize < 50 * 1024 * 1024) {
     return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 2, pendingChunkCount));
   }
 
-  if (fileSize < 750 * 1024 * 1024) {
+  if (fileSize < 200 * 1024 * 1024) {
     return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 4, pendingChunkCount));
   }
 
-  if (fileSize < 2 * 1024 * 1024 * 1024) {
+  if (fileSize < 1024 * 1024 * 1024) {
     return Math.max(1, Math.min(DEFAULT_TRANSFER_LANES, 6, pendingChunkCount));
   }
 
