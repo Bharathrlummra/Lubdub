@@ -288,8 +288,15 @@ function createChunkedTransferServer({
       }
 
       // Data may have arrived during async onChunk work; re-check.
+      // Use setImmediate to avoid stack overflow — without it, if the
+      // buffer has ≥4 bytes but not enough for a complete frame, this
+      // would call processBuffer() synchronously in an infinite loop.
       if (bufList.length >= 4) {
-        processBuffer().catch(handleProcessError);
+        setImmediate(() => {
+          if (!processing && !socket.destroyed) {
+            processBuffer().catch(handleProcessError);
+          }
+        });
       }
     }
 
