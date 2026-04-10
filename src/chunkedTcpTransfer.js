@@ -287,17 +287,10 @@ function createChunkedTransferServer({
         processing = false;
       }
 
-      // Data may have arrived during async onChunk work; re-check.
-      // Use setImmediate to avoid stack overflow — without it, if the
-      // buffer has ≥4 bytes but not enough for a complete frame, this
-      // would call processBuffer() synchronously in an infinite loop.
-      if (bufList.length >= 4) {
-        setImmediate(() => {
-          if (!processing && !socket.destroyed) {
-            processBuffer().catch(handleProcessError);
-          }
-        });
-      }
+      // No re-check needed here. The while loop above already processes
+      // ALL available complete messages before breaking. When new TCP
+      // data arrives, the socket "data" handler will call processBuffer()
+      // again since processing is now false.
     }
 
     socket.on("data", (chunk) => {
